@@ -1,0 +1,100 @@
+diff --git a/servers/rendering/renderer_canvas_cull.cpp b/servers/rendering/renderer_canvas_cull.cpp
+index 8d64193974a2645bf1f865f283e5bb9935ac7ae1..aea30f880ee819b7c3653b7588d12f501350020f 100644
+--- a/servers/rendering/renderer_canvas_cull.cpp
++++ b/servers/rendering/renderer_canvas_cull.cpp
+@@ -191,7 +191,7 @@ void RendererCanvasCull::_mark_ysort_dirty(RendererCanvasCull::Item *ysort_owner
+ 	} while (ysort_owner && ysort_owner->sort_y);
+ }
+ 
+-void RendererCanvasCull::_detect_screen_transform_snap_axes(Item *p_item, const Point2 &p_world_origin, bool &r_moving_x, bool &r_moving_y) {
++void RendererCanvasCull::_detect_screen_transform_snap_axes(Item *p_item, const Point2 &p_world_origin, const Point2 &p_canvas_origin, const Point2 &p_gpu_origin, bool &r_moving_x, bool &r_moving_y) {
+ 	if (p_item->screen_transform_snap_world_origin_valid) {
+ 		const real_t epsilon = RendererSnap2D::SCREEN_TRANSFORM_SNAP_MOVING_EPSILON;
+ 		const Point2 delta = p_world_origin - p_item->screen_transform_snap_world_origin_prev;
+@@ -230,6 +230,17 @@ void RendererCanvasCull::_detect_screen_transform_snap_axes(Item *p_item, const
+ 		r_moving_y = true;
+ 	}
+ 
++	// Switching between GPU and canvas snap changes the rendered pixel whenever the two roundings
++	// disagree (e.g. a platform creeping to a stop or starting to move again). Only switch on a
++	// frame where both give the same pixel, otherwise keep the current mode.
++	const real_t bias = RendererSnap2D::SCREEN_TRANSFORM_SNAP_ROUNDING_BIAS;
++	if (r_moving_x != p_item->screen_transform_snap_x && Math::floor(p_canvas_origin.x + 0.5) != Math::floor(p_gpu_origin.x + 0.5 + bias)) {
++		r_moving_x = p_item->screen_transform_snap_x;
++	}
++	if (r_moving_y != p_item->screen_transform_snap_y && Math::floor(p_canvas_origin.y + 0.5) != Math::floor(p_gpu_origin.y + 0.5 + bias)) {
++		r_moving_y = p_item->screen_transform_snap_y;
++	}
++
+ 	p_item->screen_transform_snap_world_origin_prev = p_world_origin;
+ 	p_item->screen_transform_snap_world_origin_valid = true;
+ }
+@@ -270,12 +281,12 @@ void RendererCanvasCull::_apply_render_origin_axis_canvas_snap(Transform2D &p_fi
+ 	p_final_xform.columns[2] = origin;
+ }
+ 
+-void RendererCanvasCull::_apply_screen_transform_snap_moving(Item *p_item, const Transform2D &p_unsnapped_final_xform, bool p_inherit_gpu_snap_x, bool p_inherit_gpu_snap_y, bool &r_gpu_snap_x, bool &r_gpu_snap_y) {
++void RendererCanvasCull::_apply_screen_transform_snap_moving(Item *p_item, const Transform2D &p_unsnapped_final_xform, const Point2 &p_canvas_origin, bool p_inherit_gpu_snap_x, bool p_inherit_gpu_snap_y, bool &r_gpu_snap_x, bool &r_gpu_snap_y) {
+ 	const Point2 world_origin = _get_screen_transform_snap_world_origin(p_unsnapped_final_xform);
+ 
+ 	bool moving_x = false;
+ 	bool moving_y = false;
+-	_detect_screen_transform_snap_axes(p_item, world_origin, moving_x, moving_y);
++	_detect_screen_transform_snap_axes(p_item, world_origin, p_canvas_origin, p_unsnapped_final_xform.get_origin(), moving_x, moving_y);
+ 	_resolve_screen_transform_snap_axes(moving_x, moving_y, p_inherit_gpu_snap_x, p_inherit_gpu_snap_y, r_gpu_snap_x, r_gpu_snap_y);
+ 
+ 	p_item->screen_transform_snap_x = r_gpu_snap_x;
+@@ -513,7 +524,7 @@ void RendererCanvasCull::_cull_canvas_item(Item *p_canvas_item, const Transform2
+ 		} else if (!uses_canvas_transform_snap && _viewport_uses_screen_transform_snap_moving && !ci->skip_screen_transform_snap && !ci->use_identity_transform) {
+ 			bool gpu_snap_x = false;
+ 			bool gpu_snap_y = false;
+-			_apply_screen_transform_snap_moving(ci, unsnapped_final_xform, p_inherit_gpu_snap_x, p_inherit_gpu_snap_y, gpu_snap_x, gpu_snap_y);
++			_apply_screen_transform_snap_moving(ci, unsnapped_final_xform, final_xform.get_origin(), p_inherit_gpu_snap_x, p_inherit_gpu_snap_y, gpu_snap_x, gpu_snap_y);
+ 			if (!gpu_snap_x && !gpu_snap_y) {
+ 				_apply_render_origin_axis_canvas_snap(final_xform, true, true);
+ 			} else if (gpu_snap_x && gpu_snap_y) {
+@@ -546,7 +557,10 @@ void RendererCanvasCull::_cull_canvas_item(Item *p_canvas_item, const Transform2
+ 		} else if (_viewport_uses_screen_transform_snap_moving && !ci->skip_screen_transform_snap && !ci->use_identity_transform) {
+ 			bool gpu_snap_x = false;
+ 			bool gpu_snap_y = false;
+-			_apply_screen_transform_snap_moving(ci, unsnapped_final_xform, p_inherit_gpu_snap_x, p_inherit_gpu_snap_y, gpu_snap_x, gpu_snap_y);
++			Transform2D canvas_self_xform = self_xform;
++			Transform2D canvas_parent_xform = snapped_parent_xform;
++			_apply_hybrid_canvas_transform_snap(canvas_self_xform, canvas_parent_xform, false, false);
++			_apply_screen_transform_snap_moving(ci, unsnapped_final_xform, (canvas_parent_xform * canvas_self_xform).get_origin(), p_inherit_gpu_snap_x, p_inherit_gpu_snap_y, gpu_snap_x, gpu_snap_y);
+ 			if (gpu_snap_x && gpu_snap_y) {
+ 				final_xform = unsnapped_final_xform;
+ 			} else {
+diff --git a/servers/rendering/renderer_canvas_cull.h b/servers/rendering/renderer_canvas_cull.h
+index 1b580d2cd04b7a9f51c517368972e3310051d460..ceabea21b206a8cf4aeb691892d648ffcec8e952 100644
+--- a/servers/rendering/renderer_canvas_cull.h
++++ b/servers/rendering/renderer_canvas_cull.h
+@@ -206,13 +206,13 @@ public:
+ 	PagedAllocator<Item::VisibilityNotifierData> visibility_notifier_allocator;
+ 	SelfList<Item::VisibilityNotifierData>::List visibility_notifier_list;
+ 
+-	void _detect_screen_transform_snap_axes(Item *p_item, const Point2 &p_world_origin, bool &r_moving_x, bool &r_moving_y);
++	void _detect_screen_transform_snap_axes(Item *p_item, const Point2 &p_world_origin, const Point2 &p_canvas_origin, const Point2 &p_gpu_origin, bool &r_moving_x, bool &r_moving_y);
+ 	void _resolve_screen_transform_snap_axes(bool p_moving_x, bool p_moving_y, bool p_inherit_gpu_snap_x, bool p_inherit_gpu_snap_y, bool &r_gpu_snap_x, bool &r_gpu_snap_y);
+ 	void _apply_axis_canvas_transform_snap(Transform2D &p_self_xform, Transform2D &p_parent_xform, bool p_canvas_snap_x, bool p_canvas_snap_y);
+ 	void _apply_hybrid_canvas_transform_snap(Transform2D &p_self_xform, Transform2D &p_parent_xform, bool p_gpu_snap_x, bool p_gpu_snap_y);
+ 	void _apply_render_origin_axis_canvas_snap(Transform2D &p_final_xform, bool p_canvas_snap_x, bool p_canvas_snap_y);
+ 	Point2 _get_screen_transform_snap_world_origin(const Transform2D &p_final_xform) const;
+-	void _apply_screen_transform_snap_moving(Item *p_item, const Transform2D &p_unsnapped_final_xform, bool p_inherit_gpu_snap_x, bool p_inherit_gpu_snap_y, bool &r_gpu_snap_x, bool &r_gpu_snap_y);
++	void _apply_screen_transform_snap_moving(Item *p_item, const Transform2D &p_unsnapped_final_xform, const Point2 &p_canvas_origin, bool p_inherit_gpu_snap_x, bool p_inherit_gpu_snap_y, bool &r_gpu_snap_x, bool &r_gpu_snap_y);
+ 	Transform2D _build_screen_transform_snap_draw_xform(const Transform2D &p_final_xform, const Transform2D &p_unsnapped_final_xform, bool p_gpu_snap_x, bool p_gpu_snap_y) const;
+ 	void _finalize_screen_transform_snap_axes(Item *p_item);
+ 	_FORCE_INLINE_ void _attach_canvas_item_for_draw(Item *ci, Item *p_canvas_clip, RendererCanvasRender::Item **r_z_list, RendererCanvasRender::Item **r_z_last_list, const Transform2D &p_transform, const Rect2 &p_clip_rect, Rect2 p_global_rect, const Color &modulate, int p_z, RendererCanvasCull::Item *p_material_owner, bool p_use_canvas_group, RendererCanvasRender::Item *r_canvas_group_from);
+diff --git a/servers/rendering/renderer_snap_2d.h b/servers/rendering/renderer_snap_2d.h
+index a745b93a6c53244916d7f7ef4438d9c3e033691d..f8e793b6fb83b8d5550e7636ebae9a744d814687 100644
+--- a/servers/rendering/renderer_snap_2d.h
++++ b/servers/rendering/renderer_snap_2d.h
+@@ -55,6 +55,8 @@ public:
+ 	// display, no interpolation) flips to canvas snap on the frames between updates and its
+ 	// rounding differs by up to 1 px, making it step back.
+ 	static constexpr uint8_t SCREEN_TRANSFORM_SNAP_MOVING_HOLD_FRAMES = 12;
++	// Must match TRANSFORM_SNAP_ROUNDING_BIAS in the canvas shaders.
++	static constexpr float SCREEN_TRANSFORM_SNAP_ROUNDING_BIAS = 0.001f;
+ 
+ 	static bool use_canvas_transform_snap(bool p_snap_2d_transforms_to_pixel, TransformSnapMethod p_method) {
+ 		return p_snap_2d_transforms_to_pixel && p_method == TRANSFORM_SNAP_CANVAS;

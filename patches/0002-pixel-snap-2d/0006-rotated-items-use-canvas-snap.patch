@@ -1,0 +1,62 @@
+diff --git a/servers/rendering/renderer_canvas_cull.cpp b/servers/rendering/renderer_canvas_cull.cpp
+index 92cf5254de83df694e4615915008e5190b1587e7..2245f67345ff410d9c0de88b61ec92253d2353c3 100644
+--- a/servers/rendering/renderer_canvas_cull.cpp
++++ b/servers/rendering/renderer_canvas_cull.cpp
+@@ -510,7 +510,23 @@ void RendererCanvasCull::_cull_canvas_item(Item *p_canvas_item, const Transform2
+ 		return;
+ 	}
+ 
+-	const bool uses_canvas_transform_snap = _item_uses_canvas_transform_snap(ci, p_parent_uses_canvas_transform_snap);
++	// A rotated (or skewed) item, and everything under it, uses canvas snap even in screen modes:
++	// per-item origin snapping would round neighbouring items differently and open seams.
++	bool rotated = false;
++	if (_snap_2d_transforms_to_pixel && _viewport_uses_screen_transform_snap) {
++		Transform2D full_xform = p_unsnapped_parent_xform;
++		if (!p_is_already_y_sorted) {
++			Transform2D early_self_xform;
++			if (!_interpolation_data.interpolation_enabled || !ci->interpolated || !ci->on_interpolate_transform_list) {
++				early_self_xform = ci->xform_curr;
++			} else {
++				TransformInterpolator::interpolate_transform_2d(ci->xform_prev, ci->xform_curr, early_self_xform, Engine::get_singleton()->get_physics_interpolation_fraction());
++			}
++			full_xform = p_unsnapped_parent_xform * early_self_xform;
++		}
++		rotated = !RendererSnap2D::is_axis_aligned(full_xform);
++	}
++	const bool uses_canvas_transform_snap = rotated || _item_uses_canvas_transform_snap(ci, p_parent_uses_canvas_transform_snap);
+ 	const bool uses_forced_screen_transform_snap = _item_uses_forced_screen_transform_snap(ci, p_parent_uses_forced_screen_transform_snap);
+ 	ci->use_canvas_transform_snap = uses_canvas_transform_snap;
+ 	ci->skip_screen_transform_snap = uses_canvas_transform_snap && _viewport_uses_screen_transform_snap;
+diff --git a/servers/rendering/renderer_snap_2d.h b/servers/rendering/renderer_snap_2d.h
+index 9272c5ac5c29a5682ade87400d4f18fe1d5b78c2..c75505931a429a0c5237ed0f5f9e397d10596eec 100644
+--- a/servers/rendering/renderer_snap_2d.h
++++ b/servers/rendering/renderer_snap_2d.h
+@@ -30,6 +30,7 @@
+ 
+ #pragma once
+ 
++#include "core/math/transform_2d.h"
+ #include "core/typedefs.h"
+ 
+ class RendererSnap2D {
+@@ -63,6 +64,20 @@ public:
+ 	// Must match TRANSFORM_SNAP_ROUNDING_BIAS in the canvas shaders.
+ 	static constexpr float SCREEN_TRANSFORM_SNAP_ROUNDING_BIAS = 0.001f;
+ 
++	// True when the transform keeps axes aligned with the pixel grid (no rotation or skew other
++	// than multiples of 90 degrees). Snapping the origin of anything else cannot align its texels
++	// and, applied per item, tears apart groups of rotating items (seams between tiles).
++	static bool is_axis_aligned(const Transform2D &p_xform) {
++		const real_t eps = 0.001;
++		const Vector2 x = p_xform.columns[0];
++		const Vector2 y = p_xform.columns[1];
++		const real_t lx = Math::abs(x.x) + Math::abs(x.y);
++		const real_t ly = Math::abs(y.x) + Math::abs(y.y);
++		const bool upright = Math::abs(x.y) <= eps * lx && Math::abs(y.x) <= eps * ly;
++		const bool quarter_turn = Math::abs(x.x) <= eps * lx && Math::abs(y.y) <= eps * ly;
++		return upright || quarter_turn;
++	}
++
+ 	static bool use_canvas_transform_snap(bool p_snap_2d_transforms_to_pixel, TransformSnapMethod p_method) {
+ 		return p_snap_2d_transforms_to_pixel && p_method == TRANSFORM_SNAP_CANVAS;
+ 	}

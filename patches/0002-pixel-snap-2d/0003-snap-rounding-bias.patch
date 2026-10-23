@@ -1,0 +1,56 @@
+diff --git a/drivers/gles3/shaders/canvas.glsl b/drivers/gles3/shaders/canvas.glsl
+index 535593d7d3508a3f624d58cdd5dcbe9de6dd8693..7efd099e2d4eac9f19c6f07627a02d0b2b7d2fdb 100644
+--- a/drivers/gles3/shaders/canvas.glsl
++++ b/drivers/gles3/shaders/canvas.glsl
+@@ -128,6 +128,10 @@ out vec2 pixel_size_interp;
+ 
+ #GLOBALS
+ 
++// Origins exactly on a pixel boundary (x.5) would flip between two pixels from float noise;
++// bias the tie so they always round the same way.
++const float TRANSFORM_SNAP_ROUNDING_BIAS = 0.001;
++
+ void main() {
+ 	varying_A = vec4(read_draw_data_world_x, read_draw_data_world_y);
+ 	varying_B = read_draw_data_color_texture_pixel_size;
+@@ -271,10 +275,10 @@ void main() {
+ 		vec2 transform_origin = (canvas_transform * model_matrix * vec4(0.0, 0.0, 0.0, 1.0)).xy;
+ 		vec2 snapped_origin = transform_origin;
+ 		if ((read_draw_data_flags & INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_X) != uint(0)) {
+-			snapped_origin.x = floor(transform_origin.x + 0.5);
++			snapped_origin.x = floor(transform_origin.x + 0.5 + TRANSFORM_SNAP_ROUNDING_BIAS);
+ 		}
+ 		if ((read_draw_data_flags & INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_Y) != uint(0)) {
+-			snapped_origin.y = floor(transform_origin.y + 0.5);
++			snapped_origin.y = floor(transform_origin.y + 0.5 + TRANSFORM_SNAP_ROUNDING_BIAS);
+ 		}
+ 		vertex += snapped_origin - transform_origin;
+ 		// Precision issue on some hardware creates artifacts within texture.
+diff --git a/servers/rendering/renderer_rd/shaders/canvas.glsl b/servers/rendering/renderer_rd/shaders/canvas.glsl
+index a24184e66964b1ecc8cae22da0accce0dbe48514..b0672f6b065a539906c87c41a2268db4359d0e2a 100644
+--- a/servers/rendering/renderer_rd/shaders/canvas.glsl
++++ b/servers/rendering/renderer_rd/shaders/canvas.glsl
+@@ -120,6 +120,10 @@ vec3 srgb_to_linear(vec3 color) {
+ }
+ #endif
+ 
++// Origins exactly on a pixel boundary (x.5) would flip between two pixels from float noise;
++// bias the tie so they always round the same way.
++const float TRANSFORM_SNAP_ROUNDING_BIAS = 0.001;
++
+ void main() {
+ #ifndef USE_ATTRIBUTES
+ 	varying_A = vec4(read_draw_data_world_x, read_draw_data_world_y);
+@@ -290,10 +294,10 @@ void main() {
+ 		vec2 transform_origin = (canvas_data.canvas_transform * model_matrix * vec4(0.0, 0.0, 0.0, 1.0)).xy;
+ 		vec2 snapped_origin = transform_origin;
+ 		if (bool(read_draw_data_flags & INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_X)) {
+-			snapped_origin.x = floor(transform_origin.x + 0.5);
++			snapped_origin.x = floor(transform_origin.x + 0.5 + TRANSFORM_SNAP_ROUNDING_BIAS);
+ 		}
+ 		if (bool(read_draw_data_flags & INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_Y)) {
+-			snapped_origin.y = floor(transform_origin.y + 0.5);
++			snapped_origin.y = floor(transform_origin.y + 0.5 + TRANSFORM_SNAP_ROUNDING_BIAS);
+ 		}
+ 		vertex += snapped_origin - transform_origin;
+ 		// Precision issue on some hardware creates artifacts within texture.

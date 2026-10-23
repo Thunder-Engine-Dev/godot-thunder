@@ -1,0 +1,97 @@
+diff --git a/servers/rendering/renderer_canvas_cull.cpp b/servers/rendering/renderer_canvas_cull.cpp
+index aea30f880ee819b7c3653b7588d12f501350020f..7c9ab1ca628b08f75ae47ec6a58730d3e0ff0ee8 100644
+--- a/servers/rendering/renderer_canvas_cull.cpp
++++ b/servers/rendering/renderer_canvas_cull.cpp
+@@ -192,9 +192,10 @@ void RendererCanvasCull::_mark_ysort_dirty(RendererCanvasCull::Item *ysort_owner
+ }
+ 
+ void RendererCanvasCull::_detect_screen_transform_snap_axes(Item *p_item, const Point2 &p_world_origin, const Point2 &p_canvas_origin, const Point2 &p_gpu_origin, bool &r_moving_x, bool &r_moving_y) {
++	Point2 delta;
+ 	if (p_item->screen_transform_snap_world_origin_valid) {
+ 		const real_t epsilon = RendererSnap2D::SCREEN_TRANSFORM_SNAP_MOVING_EPSILON;
+-		const Point2 delta = p_world_origin - p_item->screen_transform_snap_world_origin_prev;
++		delta = p_world_origin - p_item->screen_transform_snap_world_origin_prev;
+ 		r_moving_x = Math::abs(delta.x) >= epsilon;
+ 		r_moving_y = Math::abs(delta.y) >= epsilon;
+ 
+@@ -217,28 +218,45 @@ void RendererCanvasCull::_detect_screen_transform_snap_axes(Item *p_item, const
+ 		r_moving_y = false;
+ 	}
+ 
++	// Holding GPU snap after movement stops only helps items that are not physics-interpolated:
++	// they are updated slower than the render rate and look stopped on the frames in between.
++	// An interpolated item changes every frame while it moves, so it settles at once instead
++	// of staying GPU-snapped (and jittering against canvas-snapped statics) for a few frames.
++	const bool interpolated = _interpolation_data.interpolation_enabled && p_item->interpolated;
++	const uint8_t hold_frames = interpolated ? 0 : RendererSnap2D::SCREEN_TRANSFORM_SNAP_MOVING_HOLD_FRAMES;
++
+ 	if (r_moving_x) {
+-		p_item->screen_transform_snap_hold_x = RendererSnap2D::SCREEN_TRANSFORM_SNAP_MOVING_HOLD_FRAMES;
++		p_item->screen_transform_snap_hold_x = hold_frames;
+ 	} else if (p_item->screen_transform_snap_hold_x > 0) {
+ 		p_item->screen_transform_snap_hold_x--;
+ 		r_moving_x = true;
+ 	}
+ 	if (r_moving_y) {
+-		p_item->screen_transform_snap_hold_y = RendererSnap2D::SCREEN_TRANSFORM_SNAP_MOVING_HOLD_FRAMES;
++		p_item->screen_transform_snap_hold_y = hold_frames;
+ 	} else if (p_item->screen_transform_snap_hold_y > 0) {
+ 		p_item->screen_transform_snap_hold_y--;
+ 		r_moving_y = true;
+ 	}
+ 
+ 	// Switching between GPU and canvas snap changes the rendered pixel whenever the two roundings
+-	// disagree (e.g. a platform creeping to a stop or starting to move again). Only switch on a
+-	// frame where both give the same pixel, otherwise keep the current mode.
++	// disagree (e.g. a platform creeping to a stop or starting to move again). Prefer switching on a
++	// frame where both give the same pixel, but wait only a few frames so that an item that really
++	// stopped does not stay GPU-snapped.
+ 	const real_t bias = RendererSnap2D::SCREEN_TRANSFORM_SNAP_ROUNDING_BIAS;
+-	if (r_moving_x != p_item->screen_transform_snap_x && Math::floor(p_canvas_origin.x + 0.5) != Math::floor(p_gpu_origin.x + 0.5 + bias)) {
++	const real_t settled_epsilon = RendererSnap2D::SCREEN_TRANSFORM_SNAP_SETTLED_EPSILON;
++	const bool wait_x_unbounded = Math::abs(delta.x) >= settled_epsilon;
++	const bool wait_y_unbounded = Math::abs(delta.y) >= settled_epsilon;
++	if (r_moving_x != p_item->screen_transform_snap_x && Math::floor(p_canvas_origin.x + 0.5) != Math::floor(p_gpu_origin.x + 0.5 + bias) && (wait_x_unbounded || p_item->screen_transform_snap_wait_x < RendererSnap2D::SCREEN_TRANSFORM_SNAP_SWITCH_MAX_WAIT_FRAMES)) {
++		p_item->screen_transform_snap_wait_x++;
+ 		r_moving_x = p_item->screen_transform_snap_x;
++	} else {
++		p_item->screen_transform_snap_wait_x = 0;
+ 	}
+-	if (r_moving_y != p_item->screen_transform_snap_y && Math::floor(p_canvas_origin.y + 0.5) != Math::floor(p_gpu_origin.y + 0.5 + bias)) {
++	if (r_moving_y != p_item->screen_transform_snap_y && Math::floor(p_canvas_origin.y + 0.5) != Math::floor(p_gpu_origin.y + 0.5 + bias) && (wait_y_unbounded || p_item->screen_transform_snap_wait_y < RendererSnap2D::SCREEN_TRANSFORM_SNAP_SWITCH_MAX_WAIT_FRAMES)) {
++		p_item->screen_transform_snap_wait_y++;
+ 		r_moving_y = p_item->screen_transform_snap_y;
++	} else {
++		p_item->screen_transform_snap_wait_y = 0;
+ 	}
+ 
+ 	p_item->screen_transform_snap_world_origin_prev = p_world_origin;
+diff --git a/servers/rendering/renderer_canvas_render.h b/servers/rendering/renderer_canvas_render.h
+index a8e58dfda649be594e9f14625b5d983abb1a522e..20612b5f2c049d8989ead9be9b81871851d5e306 100644
+--- a/servers/rendering/renderer_canvas_render.h
++++ b/servers/rendering/renderer_canvas_render.h
+@@ -381,6 +381,8 @@ public:
+ 		Point2 screen_transform_snap_world_origin_prev;
+ 		uint8_t screen_transform_snap_hold_x = 0;
+ 		uint8_t screen_transform_snap_hold_y = 0;
++		uint8_t screen_transform_snap_wait_x = 0;
++		uint8_t screen_transform_snap_wait_y = 0;
+ 
+ 		Rect2 global_rect_cache;
+ 
+diff --git a/servers/rendering/renderer_snap_2d.h b/servers/rendering/renderer_snap_2d.h
+index f8e793b6fb83b8d5550e7636ebae9a744d814687..9272c5ac5c29a5682ade87400d4f18fe1d5b78c2 100644
+--- a/servers/rendering/renderer_snap_2d.h
++++ b/servers/rendering/renderer_snap_2d.h
+@@ -55,6 +55,11 @@ public:
+ 	// display, no interpolation) flips to canvas snap on the frames between updates and its
+ 	// rounding differs by up to 1 px, making it step back.
+ 	static constexpr uint8_t SCREEN_TRANSFORM_SNAP_MOVING_HOLD_FRAMES = 12;
++	// An axis whose per-frame movement is below this has really stopped (as opposed to creeping).
++	static constexpr float SCREEN_TRANSFORM_SNAP_SETTLED_EPSILON = 0.0005f;
++	// Longest wait for the GPU and canvas roundings to agree before switching mode anyway,
++	// only for an axis that has really stopped.
++	static constexpr uint8_t SCREEN_TRANSFORM_SNAP_SWITCH_MAX_WAIT_FRAMES = 2;
+ 	// Must match TRANSFORM_SNAP_ROUNDING_BIAS in the canvas shaders.
+ 	static constexpr float SCREEN_TRANSFORM_SNAP_ROUNDING_BIAS = 0.001f;
+ 

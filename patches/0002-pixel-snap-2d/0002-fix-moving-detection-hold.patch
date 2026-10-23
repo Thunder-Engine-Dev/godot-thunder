@@ -1,0 +1,53 @@
+diff --git a/servers/rendering/renderer_canvas_cull.cpp b/servers/rendering/renderer_canvas_cull.cpp
+index ff9f6beae637f4cb5fe2ef75e1c554b73f0e0e7d..8d64193974a2645bf1f865f283e5bb9935ac7ae1 100644
+--- a/servers/rendering/renderer_canvas_cull.cpp
++++ b/servers/rendering/renderer_canvas_cull.cpp
+@@ -217,6 +217,19 @@ void RendererCanvasCull::_detect_screen_transform_snap_axes(Item *p_item, const
+ 		r_moving_y = false;
+ 	}
+ 
++	if (r_moving_x) {
++		p_item->screen_transform_snap_hold_x = RendererSnap2D::SCREEN_TRANSFORM_SNAP_MOVING_HOLD_FRAMES;
++	} else if (p_item->screen_transform_snap_hold_x > 0) {
++		p_item->screen_transform_snap_hold_x--;
++		r_moving_x = true;
++	}
++	if (r_moving_y) {
++		p_item->screen_transform_snap_hold_y = RendererSnap2D::SCREEN_TRANSFORM_SNAP_MOVING_HOLD_FRAMES;
++	} else if (p_item->screen_transform_snap_hold_y > 0) {
++		p_item->screen_transform_snap_hold_y--;
++		r_moving_y = true;
++	}
++
+ 	p_item->screen_transform_snap_world_origin_prev = p_world_origin;
+ 	p_item->screen_transform_snap_world_origin_valid = true;
+ }
+diff --git a/servers/rendering/renderer_canvas_render.h b/servers/rendering/renderer_canvas_render.h
+index 6596a5e9ac748195df60bd61d431a50a7e58787f..a8e58dfda649be594e9f14625b5d983abb1a522e 100644
+--- a/servers/rendering/renderer_canvas_render.h
++++ b/servers/rendering/renderer_canvas_render.h
+@@ -379,6 +379,8 @@ public:
+ 		bool screen_transform_snap_y = false;
+ 		bool screen_transform_snap_world_origin_valid = false;
+ 		Point2 screen_transform_snap_world_origin_prev;
++		uint8_t screen_transform_snap_hold_x = 0;
++		uint8_t screen_transform_snap_hold_y = 0;
+ 
+ 		Rect2 global_rect_cache;
+ 
+diff --git a/servers/rendering/renderer_snap_2d.h b/servers/rendering/renderer_snap_2d.h
+index 1aea5a1ba36258114c977bfd3cfa8435a17c5abc..a745b93a6c53244916d7f7ef4438d9c3e033691d 100644
+--- a/servers/rendering/renderer_snap_2d.h
++++ b/servers/rendering/renderer_snap_2d.h
+@@ -50,6 +50,11 @@ public:
+ 	// CharacterBody floor resolution can oscillate ~0.017 px on the secondary axis while
+ 	// moving on the primary axis. Suppress GPU snap on such an axis when another axis dominates.
+ 	static constexpr float SCREEN_TRANSFORM_SNAP_MOVING_JITTER_EPSILON = 0.02f;
++	// Keep an axis in GPU snap for this many rendered frames after its last detected movement.
++	// Without it, an item updated slower than the render rate (e.g. 60 Hz physics on a 144 Hz
++	// display, no interpolation) flips to canvas snap on the frames between updates and its
++	// rounding differs by up to 1 px, making it step back.
++	static constexpr uint8_t SCREEN_TRANSFORM_SNAP_MOVING_HOLD_FRAMES = 12;
+ 
+ 	static bool use_canvas_transform_snap(bool p_snap_2d_transforms_to_pixel, TransformSnapMethod p_method) {
+ 		return p_snap_2d_transforms_to_pixel && p_method == TRANSFORM_SNAP_CANVAS;
