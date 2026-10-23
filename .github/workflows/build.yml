@@ -30,11 +30,11 @@ env:
   GODOT_REF: ${{ inputs.godot_ref || '4.7' }}
   BUILD_NAME: ${{ inputs.build_name || 'thunder' }}
   SCONS_CACHE_LIMIT: 4096
-  # Build environment pinned to what godotengine/build-containers and
-  # godot-build-scripts use (see their Dockerfile.* and build.sh).
-  GODOT_SDK_VERSION: godot-2026.05.x-1
-  LLVM_MINGW_VERSION: "20260616"
-  ACCESSKIT_VERSION: "0.23.1"
+  # Build environment pinned to the 4.7 branches of godotengine/build-containers
+  # and godot-build-scripts (Dockerfile.* / build.sh). Re-check on a new Godot branch.
+  GODOT_SDK_VERSION: godot-2023.08.x-4
+  ACCESSKIT_VERSION: "0.22.3"
+  WINRT_RELEASE: "72"
   ANGLE_RELEASE: chromium%2F7578
   MESA_RELEASE: 25.3.1-3
   SCONS_VERSION: "4.10.1"
@@ -63,7 +63,7 @@ jobs:
     needs: check-patches
     runs-on: ubuntu-24.04
     # Same base image as godotengine/build-containers (Dockerfile.base).
-    container: fedora:44
+    container: fedora:43
     strategy:
       fail-fast: false
       matrix:
@@ -107,6 +107,9 @@ jobs:
           unzip -o accesskit.zip && rm -f accesskit.zip
           mv accesskit-c-* accesskit-c
           if [ "${{ matrix.platform }}" = windows ]; then
+            mkdir -p /root/winrt && cd /root/winrt
+            curl -fL -o winrt.zip https://github.com/godotengine/winrt-mingw/releases/download/${WINRT_RELEASE}/winrt-headers.zip
+            unzip -o winrt.zip && rm -f winrt.zip
             mkdir -p /root/angle && cd /root/angle
             curl -fL -o angle.zip https://github.com/godotengine/godot-angle-static/releases/download/${ANGLE_RELEASE}/godot-angle-static-x86_64-gcc-13-release.zip
             unzip -o angle.zip && rm -f angle.zip
@@ -138,11 +141,11 @@ jobs:
           BUILD_NAME: ${{ env.BUILD_NAME }}
           GODOT_VERSION_STATUS: ${{ needs.check-patches.outputs.status }}
         run: |
-          # Flags as in godot-build-scripts/build-{linux,windows}/build.sh
+          # Flags as in godot-build-scripts (4.7 branch) build-{linux,windows}/build.sh
           SCONS="scons -j$(nproc) verbose=yes warnings=no progress=no redirect_build_objects=no"
-          OPTIONS="production=yes debug_symbols=yes separate_debug_symbols=yes debug_paths_relative=yes accesskit_sdk_path=/root/accesskit/accesskit-c"
+          OPTIONS="production=yes accesskit_sdk_path=/root/accesskit/accesskit-c"
           if [ "${{ matrix.platform }}" = windows ]; then
-            OPTIONS="$OPTIONS use_mingw=yes angle_libs=/root/angle mesa_libs=/root/mesa d3d12=yes"
+            OPTIONS="$OPTIONS use_mingw=yes angle_libs=/root/angle mesa_libs=/root/mesa d3d12=yes winrt_path=/root/winrt"
           fi
           $SCONS platform=${{ matrix.platform }} arch=x86_64 $OPTIONS target=${{ matrix.target }}
           ls -l bin
@@ -176,15 +179,12 @@ jobs:
           echo "$VERSION" > tpz/templates/version.txt
 
           a=artifacts
-          mkdir -p dsym
           # Naming follows godot-build-scripts/build-release.sh
           for t in debug release; do
             cp $a/linuxbsd-template_$t/godot.linuxbsd.template_$t.x86_64 tpz/templates/linux_$t.x86_64
             src=$a/windows-template_$t/godot.windows.template_$t.x86_64
             cp $src.exe         tpz/templates/windows_${t}_x86_64.exe
             cp $src.console.exe tpz/templates/windows_${t}_x86_64_console.exe
-            cp $a/linuxbsd-template_$t/*.debugsymbols dsym/ 2>/dev/null || true
-            cp $a/windows-template_$t/*.debugsymbols  dsym/ 2>/dev/null || true
           done
           (cd tpz && zip -r "../dist/Godot_v${VERSION}_export_templates.tpz" templates)
 
@@ -197,8 +197,6 @@ jobs:
           cp ../$a/windows-editor/godot.windows.editor.x86_64.console.exe "Godot_v${VERSION}_win64_console.exe"
           zip -9 "../dist/Godot_v${VERSION}_win64.exe.zip" "Godot_v${VERSION}_win64.exe" "Godot_v${VERSION}_win64_console.exe"
           cd ..
-          cp $a/linuxbsd-editor/*.debugsymbols $a/windows-editor/*.debugsymbols dsym/ 2>/dev/null || true
-          (cd dsym && zip -9 "../dist/Godot_v${VERSION}_debugsymbols.zip" *)
           (cd dist && sha512sum * > SHA512-SUMS.txt)
 
       - uses: actions/upload-artifact@v4
