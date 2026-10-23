@@ -14,9 +14,9 @@ Patch set for Godot used by Thunder Engine. No Godot fork: upstream is cloned in
 
 Actions → *Build Thunder Godot* → Run workflow. Pick the branch of this repo with the patches ("Use workflow from"), then set:
 
-- `version` — release name, e.g. `4.7.3-rc2`. The part before `-` must match upstream `version.py` (checked), the part after becomes `GODOT_VERSION_STATUS` (version string `4.7.3.rc2.thunder`). It is also the default release tag.
+- `version` — release name, e.g. `4.7.3-rc2`. The part before `-` must match upstream `version.py` (checked), the part after becomes `GODOT_VERSION_STATUS` (version string `4.7.3.rc2`, build name is a separate suffix). It is also the default release tag.
 - `godot_ref` — upstream branch, tag or full commit SHA. A branch (`4.7`) means its latest commit; it is resolved once and every job builds that exact commit (shown in the release notes).
-- `build_name` — suffix of the version string (default `thunder`)
+- `build_name` — build name baked into the editor/templates (default `thunder`, shown in the About dialog; templates are looked up without it)
 - `publish` — create a GitHub release (editor zips, `.tpz` export templates, SHA512 sums)
 
 Builds mirror godotengine/build-containers + godot-build-scripts (no signing): `fedora:43` container, Linux via the Godot buildroot SDK, Windows via MinGW GCC (`use_mingw=yes`, D3D12, ANGLE, Mesa/NIR, AccessKit), flags `production=yes`. Dependency versions are pinned in the workflow `env` from the matching branch (e.g. `4.7`) of those repos; update them when moving to a new Godot branch. Targets: Linux and Windows x86_64, editor + debug/release templates, no Mono.

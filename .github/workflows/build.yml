@@ -54,8 +54,8 @@ jobs:
       - id: ver
         run: |
           echo "sha=$(git -C "$RUNNER_TEMP/godot" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "version=$(python3 scripts/godot-version.py "$RUNNER_TEMP/godot" "$VERSION_NAME" "$BUILD_NAME" 2>/dev/null)" >> "$GITHUB_OUTPUT"
-          python3 scripts/godot-version.py "$RUNNER_TEMP/godot" "$VERSION_NAME" "$BUILD_NAME" >/dev/null   # surfaces errors
+          echo "version=$(python3 scripts/godot-version.py "$RUNNER_TEMP/godot" "$VERSION_NAME" 2>/dev/null)" >> "$GITHUB_OUTPUT"
+          python3 scripts/godot-version.py "$RUNNER_TEMP/godot" "$VERSION_NAME" >/dev/null   # surfaces errors
           echo "status=${VERSION_NAME#*-}" >> "$GITHUB_OUTPUT"
 
   build:
@@ -166,7 +166,10 @@ jobs:
     needs: [check-patches, build]
     runs-on: ubuntu-24.04
     env:
-      VERSION: ${{ needs.check-patches.outputs.version }}
+      # Template version (version.txt): major.minor.patch.status, no build name
+      TEMPLATES_VERSION: ${{ needs.check-patches.outputs.version }}
+      UPSTREAM_SHA: ${{ needs.check-patches.outputs.sha }}
+      BASENAME: Godot_v${{ inputs.version || '4.7.3-rc2' }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -175,33 +178,33 @@ jobs:
       - name: Assemble archives
         run: |
           set -e
-          mkdir -p dist tpz/templates
-          echo "$VERSION" > tpz/templates/version.txt
+          mkdir -p dist tpz/templates stage
+          a=$PWD/artifacts
 
-          a=artifacts
-          # Naming follows godot-build-scripts/build-release.sh
+          # Export templates (layout of godot-build-scripts/build-release.sh)
+          curl -fL -o tpz/templates/icudt_godot.dat \
+            "https://raw.githubusercontent.com/godotengine/godot/${UPSTREAM_SHA}/thirdparty/icu4c/icudt_godot.dat"
+          echo "$TEMPLATES_VERSION" > tpz/templates/version.txt
           for t in debug release; do
             cp $a/linuxbsd-template_$t/godot.linuxbsd.template_$t.x86_64 tpz/templates/linux_$t.x86_64
             src=$a/windows-template_$t/godot.windows.template_$t.x86_64
             cp $src.exe         tpz/templates/windows_${t}_x86_64.exe
             cp $src.console.exe tpz/templates/windows_${t}_x86_64_console.exe
           done
-          (cd tpz && zip -r "../dist/Godot_v${VERSION}_export_templates.tpz" templates)
+          (cd tpz && zip -q -9 -r -D "../dist/${BASENAME}_export_templates.zip" templates/*)
 
-          # Linux editor: single binary; Windows editor: exe + console wrapper
-          mkdir stage && cd stage
-          cp ../$a/linuxbsd-editor/godot.linuxbsd.editor.x86_64 "Godot_v${VERSION}_linux.x86_64"
-          chmod +x "Godot_v${VERSION}_linux.x86_64"
-          zip -9 "../dist/Godot_v${VERSION}_linux.x86_64.zip" "Godot_v${VERSION}_linux.x86_64"
-          cp ../$a/windows-editor/godot.windows.editor.x86_64.exe         "Godot_v${VERSION}_win64.exe"
-          cp ../$a/windows-editor/godot.windows.editor.x86_64.console.exe "Godot_v${VERSION}_win64_console.exe"
-          zip -9 "../dist/Godot_v${VERSION}_win64.exe.zip" "Godot_v${VERSION}_win64.exe" "Godot_v${VERSION}_win64_console.exe"
-          cd ..
-          (cd dist && sha512sum * > SHA512-SUMS.txt)
+          # Editors
+          cd stage
+          cp $a/linuxbsd-editor/godot.linuxbsd.editor.x86_64 ${BASENAME}_linux.x86_64
+          chmod +x ${BASENAME}_linux.x86_64
+          zip -q -9 "../dist/${BASENAME}_linux.x86_64.zip" ${BASENAME}_linux.x86_64
+          cp $a/windows-editor/godot.windows.editor.x86_64.exe         ${BASENAME}_win64.exe
+          cp $a/windows-editor/godot.windows.editor.x86_64.console.exe ${BASENAME}_win64_console.exe
+          zip -q -9 "../dist/${BASENAME}_win64.exe.zip" ${BASENAME}_win64.exe ${BASENAME}_win64_console.exe
 
       - uses: actions/upload-artifact@v4
         with:
-          name: release-${{ env.VERSION }}
+          name: release-${{ env.BASENAME }}
           path: dist/*
 
       - name: Publish release
@@ -211,8 +214,10 @@ jobs:
         run: |
           tag="${{ inputs.release_tag }}"
           [ -n "$tag" ] || tag="$VERSION_NAME"
-          gh release create "$tag" dist/* --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" --title "Godot $VERSION" \
-            --notes "Upstream: \`$GODOT_REF\` @ \`${{ needs.check-patches.outputs.sha }}\`. Patches from \`$GITHUB_REF_NAME\` @ \`${GITHUB_SHA::8}\`."
+          flags=""
+          case "$VERSION_NAME" in *-stable) ;; *) flags="--prerelease" ;; esac
+          gh release create "$tag" dist/* --repo "$GITHUB_REPOSITORY" $flags \
+            --target "$GITHUB_SHA" --title "$tag" \
+            --notes "Upstream: [godotengine/godot@${UPSTREAM_SHA::10}](https://github.com/godotengine/godot/commit/${UPSTREAM_SHA}) (\`$GODOT_REF\`)"
     permissions:
       contents: write
