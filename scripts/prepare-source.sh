@@ -21,12 +21,9 @@ fi
 echo "upstream commit: $(git -C "$dest" rev-parse HEAD)"
 
 cd "$dest"
-git config user.name  "thunder-patcher"
-git config user.email "thunder-patcher@users.noreply.github.com"
 
 shopt -s nullglob
 for patch in "$root"/patches/*/*.patch; do
 	echo ">> applying ${patch#"$root"/}"
 	git apply --index --whitespace=nowarn "$patch"
 done
-git commit -q -m "Thunder patches" || true
