@@ -1,0 +1,220 @@
+name: Build Thunder Godot
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release name, e.g. 4.7.3-rc2 (before '-': upstream version, after: version status)"
+        required: true
+        default: "4.7.3-rc2"
+      godot_ref:
+        description: "Upstream Godot branch, tag or commit SHA to patch (branch = its latest commit)"
+        required: true
+        default: "4.7"
+      build_name:
+        description: "Custom build name appended to the version string"
+        required: true
+        default: "thunder"
+      publish:
+        description: "Create a GitHub release with the artifacts"
+        type: boolean
+        default: false
+      release_tag:
+        description: "Release tag (only used when publishing; default: the version)"
+        required: false
+  pull_request:
+    paths: ["patches/**", "scripts/**", ".github/workflows/**"]
+
+env:
+  VERSION_NAME: ${{ inputs.version || '4.7.3-rc2' }}
+  GODOT_REF: ${{ inputs.godot_ref || '4.7' }}
+  BUILD_NAME: ${{ inputs.build_name || 'thunder' }}
+  SCONS_CACHE_LIMIT: 4096
+  # Build environment pinned to what godotengine/build-containers and
+  # godot-build-scripts use (see their Dockerfile.* and build.sh).
+  GODOT_SDK_VERSION: godot-2026.05.x-1
+  LLVM_MINGW_VERSION: "20260616"
+  ACCESSKIT_VERSION: "0.23.1"
+  ANGLE_RELEASE: chromium%2F7578
+  MESA_RELEASE: 25.3.1-3
+  SCONS_VERSION: "4.10.1"
+
+jobs:
+  check-patches:
+    name: Check patches apply
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      status: ${{ steps.ver.outputs.status }}
+      sha: ${{ steps.ver.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      # Resolve the ref once so every build job uses the same upstream commit.
+      - run: scripts/prepare-source.sh "$GODOT_REF" "$RUNNER_TEMP/godot"
+      - id: ver
+        run: |
+          echo "sha=$(git -C "$RUNNER_TEMP/godot" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "version=$(python3 scripts/godot-version.py "$RUNNER_TEMP/godot" "$VERSION_NAME" "$BUILD_NAME" 2>/dev/null)" >> "$GITHUB_OUTPUT"
+          python3 scripts/godot-version.py "$RUNNER_TEMP/godot" "$VERSION_NAME" "$BUILD_NAME" >/dev/null   # surfaces errors
+          echo "status=${VERSION_NAME#*-}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.name }}
+    needs: check-patches
+    runs-on: ubuntu-24.04
+    # Same base image as godotengine/build-containers (Dockerfile.base).
+    container: fedora:44
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux editor,             platform: linuxbsd, target: editor,           out: godot.linuxbsd.editor.x86_64 }
+          - { name: Linux template debug,     platform: linuxbsd, target: template_debug,   out: godot.linuxbsd.template_debug.x86_64 }
+          - { name: Linux template release,   platform: linuxbsd, target: template_release, out: godot.linuxbsd.template_release.x86_64 }
+          - { name: Windows editor,           platform: windows,  target: editor,           out: godot.windows.editor.x86_64 }
+          - { name: Windows template debug,   platform: windows,  target: template_debug,   out: godot.windows.template_debug.x86_64 }
+          - { name: Windows template release, platform: windows,  target: template_release, out: godot.windows.template_release.x86_64 }
+    steps:
+      - name: Install base packages
+        run: |
+          dnf -y install --setopt=install_weak_deps=False \
+            bash binutils bzip2 curl file findutils gettext git make patch pkgconfig \
+            python3-pip unzip which xz zip
+          pip install scons==${SCONS_VERSION}
+
+      - name: Install Linux toolchain (Godot buildroot SDK)
+        if: matrix.platform == 'linuxbsd'
+        run: |
+          dnf -y install --setopt=install_weak_deps=False wayland-devel
+          cd /root
+          curl -fLO https://github.com/godotengine/buildroot/releases/download/${GODOT_SDK_VERSION}/x86_64-godot-linux-gnu_sdk-buildroot.tar.bz2
+          tar xf x86_64-godot-linux-gnu_sdk-buildroot.tar.bz2
+          rm -f x86_64-godot-linux-gnu_sdk-buildroot.tar.bz2
+          (cd x86_64-godot-linux-gnu_sdk-buildroot && ./relocate-sdk.sh)
+          echo "GODOT_SDK_LINUX_X86_64=/root/x86_64-godot-linux-gnu_sdk-buildroot" >> "$GITHUB_ENV"
+          echo "/root/x86_64-godot-linux-gnu_sdk-buildroot/bin" >> "$GITHUB_PATH"
+
+      - name: Install Windows toolchain (MinGW)
+        if: matrix.platform == 'windows'
+        run: |
+          dnf -y install --setopt=install_weak_deps=False \
+            mingw64-gcc mingw64-gcc-c++ mingw64-winpthreads-static
+
+      - name: Download third-party SDKs
+        run: |
+          mkdir -p /root/accesskit && cd /root/accesskit
+          curl -fL -o accesskit.zip https://github.com/godotengine/godot-accesskit-c-static/releases/download/${ACCESSKIT_VERSION}/accesskit-c-${ACCESSKIT_VERSION}.zip
+          unzip -o accesskit.zip && rm -f accesskit.zip
+          mv accesskit-c-* accesskit-c
+          if [ "${{ matrix.platform }}" = windows ]; then
+            mkdir -p /root/angle && cd /root/angle
+            curl -fL -o angle.zip https://github.com/godotengine/godot-angle-static/releases/download/${ANGLE_RELEASE}/godot-angle-static-x86_64-gcc-13-release.zip
+            unzip -o angle.zip && rm -f angle.zip
+            mkdir -p /root/mesa && cd /root/mesa
+            curl -fL -o mesa.zip https://github.com/godotengine/godot-nir-static/releases/download/${MESA_RELEASE}/godot-nir-static-x86_64-gcc-release.zip
+            unzip -o mesa.zip && rm -f mesa.zip
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Prepare patched source
+        run: |
+          git config --global --add safe.directory '*'
+          scripts/prepare-source.sh "${{ needs.check-patches.outputs.sha }}" godot
+
+      - name: Restore SCons cache
+        uses: actions/cache@v4
+        with:
+          path: godot/.scons_cache
+          key: scons-${{ matrix.platform }}-${{ matrix.target }}-${{ env.GODOT_REF }}-${{ github.run_id }}
+          restore-keys: |
+            scons-${{ matrix.platform }}-${{ matrix.target }}-${{ env.GODOT_REF }}-
+
+      - name: Build
+        working-directory: godot
+        env:
+          SCONS_CACHE: ${{ github.workspace }}/godot/.scons_cache
+          TERM: xterm
+          BUILD_NAME: ${{ env.BUILD_NAME }}
+          GODOT_VERSION_STATUS: ${{ needs.check-patches.outputs.status }}
+        run: |
+          # Flags as in godot-build-scripts/build-{linux,windows}/build.sh
+          SCONS="scons -j$(nproc) verbose=yes warnings=no progress=no redirect_build_objects=no"
+          OPTIONS="production=yes debug_symbols=yes separate_debug_symbols=yes debug_paths_relative=yes accesskit_sdk_path=/root/accesskit/accesskit-c"
+          if [ "${{ matrix.platform }}" = windows ]; then
+            OPTIONS="$OPTIONS use_mingw=yes angle_libs=/root/angle mesa_libs=/root/mesa d3d12=yes"
+          fi
+          $SCONS platform=${{ matrix.platform }} arch=x86_64 $OPTIONS target=${{ matrix.target }}
+          ls -l bin
+
+      - name: Collect output
+        run: |
+          mkdir -p out
+          cp -rvp godot/bin/* out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}-${{ matrix.target }}
+          path: out/*
+          if-no-files-found: error
+
+  package:
+    name: Package
+    needs: [check-patches, build]
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.check-patches.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble archives
+        run: |
+          set -e
+          mkdir -p dist tpz/templates
+          echo "$VERSION" > tpz/templates/version.txt
+
+          a=artifacts
+          mkdir -p dsym
+          # Naming follows godot-build-scripts/build-release.sh
+          for t in debug release; do
+            cp $a/linuxbsd-template_$t/godot.linuxbsd.template_$t.x86_64 tpz/templates/linux_$t.x86_64
+            src=$a/windows-template_$t/godot.windows.template_$t.x86_64
+            cp $src.exe         tpz/templates/windows_${t}_x86_64.exe
+            cp $src.console.exe tpz/templates/windows_${t}_x86_64_console.exe
+            cp $a/linuxbsd-template_$t/*.debugsymbols dsym/ 2>/dev/null || true
+            cp $a/windows-template_$t/*.debugsymbols  dsym/ 2>/dev/null || true
+          done
+          (cd tpz && zip -r "../dist/Godot_v${VERSION}_export_templates.tpz" templates)
+
+          # Linux editor: single binary; Windows editor: exe + console wrapper
+          mkdir stage && cd stage
+          cp ../$a/linuxbsd-editor/godot.linuxbsd.editor.x86_64 "Godot_v${VERSION}_linux.x86_64"
+          chmod +x "Godot_v${VERSION}_linux.x86_64"
+          zip -9 "../dist/Godot_v${VERSION}_linux.x86_64.zip" "Godot_v${VERSION}_linux.x86_64"
+          cp ../$a/windows-editor/godot.windows.editor.x86_64.exe         "Godot_v${VERSION}_win64.exe"
+          cp ../$a/windows-editor/godot.windows.editor.x86_64.console.exe "Godot_v${VERSION}_win64_console.exe"
+          zip -9 "../dist/Godot_v${VERSION}_win64.exe.zip" "Godot_v${VERSION}_win64.exe" "Godot_v${VERSION}_win64_console.exe"
+          cd ..
+          cp $a/linuxbsd-editor/*.debugsymbols $a/windows-editor/*.debugsymbols dsym/ 2>/dev/null || true
+          (cd dsym && zip -9 "../dist/Godot_v${VERSION}_debugsymbols.zip" *)
+          (cd dist && sha512sum * > SHA512-SUMS.txt)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ env.VERSION }}
+          path: dist/*
+
+      - name: Publish release
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ inputs.release_tag }}"
+          [ -n "$tag" ] || tag="$VERSION_NAME"
+          gh release create "$tag" dist/* --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "Godot $VERSION" \
+            --notes "Upstream: \`$GODOT_REF\` @ \`${{ needs.check-patches.outputs.sha }}\`. Patches from \`$GITHUB_REF_NAME\` @ \`${GITHUB_SHA::8}\`."
+    permissions:
+      contents: write

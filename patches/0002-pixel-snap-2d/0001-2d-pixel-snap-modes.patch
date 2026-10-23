@@ -1,0 +1,2196 @@
+diff --git a/PIXEL_SNAP_GPU_FORWARD_PORT.md b/PIXEL_SNAP_GPU_FORWARD_PORT.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..44ebb7831dcbd244f5149adedfef1f701fc592b1
+--- /dev/null
++++ b/PIXEL_SNAP_GPU_FORWARD_PORT.md
+@@ -0,0 +1,656 @@
++# Forward-port: Screen Space 2D transform pixel snap (Godot 4.7+)
++
++Guide for developers and agents when forward-porting this patch to newer Godot versions and resolving merge conflicts.
++
++**Patch base version:** Godot 4.7 / 4.7.1-rc  
++**Patch goal:** Screen-space 2D transform pixel snap modes for `snap_2d_transforms_to_pixel` — no jitter with physics interpolation and scrolling cameras, without corner stretching (unlike `snap_2d_vertices_to_pixel`).
++
++**Modes:**
++
++| Int | Name | Summary |
++|-----|------|---------|
++| `0` | **Canvas Space** | Upstream CPU canvas snap (default) |
++| `1` | **Screen Space** | Always GPU screen snap (full patch v1) |
++| `2` | **Screen Space When Moving** | Hybrid: canvas snap when static in world space, per-axis GPU screen snap when moving |
++
++### Post-port fixes (documented in §3.4)
++
++| Fix | Problem | Solution |
++|-----|---------|----------|
++| **Per-axis draw transform** | Mixed GPU/canvas: `final_xform` quantizes moving axis before shader; unsnapped-only loses static-axis canvas snap on descendants | `_build_screen_transform_snap_draw_xform()` + `_attach_canvas_item_for_draw` uses **`draw_xform`** |
++| **Child snapped chain** | `child_snapped_parent = gpu ? unsnapped : final` broke cumulative canvas snap under fractional static parents | **`child_snapped_parent = final_xform` always**; unsnapped chain for detection only |
++| **Per-item Screen Space** | No way to force always-GPU without axis detection | `SNAP_2D_TRANSFORMS_MODE_SCREEN` + `_item_uses_forced_screen_transform_snap()` |
++| **Jitter detection** | Dominance ratio (2×) redundant with jitter epsilon for typical physics oscillation | Removed `DOMINANT_AXIS_RATIO`; keep epsilon `0.01` + jitter `0.02` only |
++
++---
++
++## 1. Patch overview
++
++### Upstream problem (canvas space snap)
++
++- Canvas space rounding on every node in the hierarchy plus a separate viewport/camera snap (`floor` / `ceil`) causes ±1 px jitter with physics interpolation, scrolling cameras, and moving platforms.
++- `snap_2d_vertices_to_pixel` removes jitter but snaps **every corner**, which can distort sprite dimensions.
++
++### Patch solution
++
++1. New enum **`snap_2d_transforms_method`**: **Canvas Space** (upstream, `0`) / **Screen Space** (`1`) / **Screen Space When Moving** (`2`, hybrid).
++2. In **Screen Space** and **Screen Space When Moving** modes:
++   - Canvas space rounding in `renderer_canvas_cull.cpp` and `renderer_viewport.cpp` is **disabled** (unless overridden per item).
++   - Transform origins are rounded in the shader **after** `canvas_transform` (camera already applied).
++   - Only the **origin** is rounded, not each corner — quad size is preserved.
++3. **Screen Space When Moving** additionally:
++   - Detects movement per axis in **world/canvas space** (camera-independent origin).
++   - Applies **CPU canvas snap** (same as mode `0`) on static axes.
++   - Applies **GPU screen snap** on moving axes (per-axis instance flags in shader).
++   - Passes **dual parent transform chains** during cull (snapped vs unsnapped) so static siblings keep cumulative canvas snap while GPU items (e.g. player) are not poisoned by ancestor canvas snap on the camera.
++   - Propagates **`inherit_gpu`** from a moving parent to children with fixed local offset.
++4. Per-viewport setting on `Viewport` / `SubViewport` (not only a project setting).
++5. Draw offset correction in `Sprite2D` / `AnimatedSprite2D` / `RichTextLabel` when transform snap is enabled.
++6. Per-item override on `CanvasItem`: **`snap_2d_transforms_mode`** (`Inherit` / **Canvas Space** / **Screen Space**) to opt into canvas space rounding, force always-GPU screen snap, or inherit from parent.
++7. Particle quad mesh offset correction when screen space snap is active (centered quads).
++
++### Recommended configuration (SubViewport)
++
++**Always screen space** (moving platforms, camera follow, physics interpolation):
++
++```
++snap_2d_transforms_to_pixel = true
++snap_2d_transforms_method = Screen Space   (Viewport.SNAP_2D_TRANSFORMS_METHOD_SCREEN = 1)
++snap_2d_vertices_to_pixel = false
++```
++
++**Hybrid — autoscroll / static tilemap at fractional positions** (MF Community Edition default):
++
++```
++snap_2d_transforms_to_pixel = true
++snap_2d_transforms_method = Screen Space When Moving   (Viewport.SNAP_2D_TRANSFORMS_METHOD_SCREEN_MOVING = 2)
++snap_2d_vertices_to_pixel = false
++```
++
++Use case for mode `2`:
++- **Static** objects (tilemap, props at non-integer world positions) → **canvas snap** — stay sharp relative to each other; no jitter vs integer-aligned tiles when the camera scrolls.
++- **Moving** objects (player, enemies, autoscroll platform/camera group) → **GPU screen snap** — no jitter between each other or vs camera; relative subpixel jitter between moving objects is invisible.
++
++Optional per-item overrides:
++
++```
++# Legacy-style canvas rounding on a screen-space viewport (no GPU shift):
++snap_2d_transforms_mode = Canvas Space   (CanvasItem.SNAP_2D_TRANSFORMS_MODE_CANVAS)
++
++# Always GPU screen snap on both axes — no movement detection (mode 2 only):
++snap_2d_transforms_mode = Screen Space   (CanvasItem.SNAP_2D_TRANSFORMS_MODE_SCREEN)
++```
++
++Per-item priority: **Canvas Space > Screen Space > Inherit** (hybrid detection). Children with **Inherit** follow the resolved mode from the parent chain.
++
++---
++
++## 2. Patch files
++
++### New file (must be added)
++
++| File | Purpose |
++|------|---------|
++| `servers/rendering/renderer_snap_2d.h` | Helpers `use_canvas_transform_snap` / `use_screen_transform_snap` and item mode enum |
++
++### Modified files (core)
++
++| Area | Files |
++|------|-------|
++| Scene API | `scene/main/viewport.h`, `scene/main/viewport.cpp`, `scene/main/canvas_item.h`, `scene/main/canvas_item.cpp` |
++| Project settings | `scene/main/scene_tree.cpp`, `editor/editor_node.cpp` |
++| RenderingServer | `servers/rendering/rendering_server.h`, `.cpp`, `rendering_server_default.h` |
++| Viewport renderer | `servers/rendering/renderer_viewport.h`, `renderer_viewport.cpp` |
++| Canvas cull | `servers/rendering/renderer_canvas_cull.h`, `renderer_canvas_cull.cpp` |
++| Canvas render API | `servers/rendering/renderer_canvas_render.h` |
++| RD backend | `servers/rendering/renderer_rd/renderer_canvas_render_rd.h`, `.cpp` |
++| GLES3 backend | `drivers/gles3/rasterizer_canvas_gles3.h`, `.cpp` |
++| Dummy backend | `servers/rendering/dummy/rasterizer_canvas_dummy.h` |
++| RD shaders | `servers/rendering/renderer_rd/shaders/canvas.glsl`, `canvas_uniforms_inc.glsl` |
++| GLES3 shaders | `drivers/gles3/shaders/canvas.glsl`, `canvas_uniforms_inc.glsl` |
++| Scene offsets | `scene/2d/sprite_2d.cpp`, `scene/2d/animated_sprite_2d.cpp`, `scene/gui/rich_text_label.cpp` |
++| Particles | `scene/2d/cpu_particles_2d.cpp`, `scene/2d/gpu_particles_2d.cpp` |
++| Parallax (canvas space only) | `scene/2d/parallax_2d.cpp` — offset workaround only for canvas space snap |
++| Docs | `doc/classes/Viewport.xml`, `doc/classes/ProjectSettings.xml`, `doc/classes/CanvasItem.xml` |
++
++### Generated shaders (if present in the repo)
++
++- `servers/rendering/renderer_rd/shaders/canvas.glsl.gen.h`
++- `servers/rendering/renderer_rd/shaders/canvas_uniforms_inc.glsl.gen.h`
++- `drivers/gles3/shaders/canvas.glsl.gen.h`
++
++> If upstream regenerates `.gen.h` during the build, edit the source **`.glsl`** files, then rebuild or sync `.gen.h` manually.
++
++---
++
++## 3. Core logic (do not break during conflicts)
++
++### 3.1. `RendererSnap2D` (`renderer_snap_2d.h`)
++
++```cpp
++enum TransformSnapMethod : uint8_t {
++    TRANSFORM_SNAP_CANVAS = 0,
++    TRANSFORM_SNAP_SCREEN = 1,
++    TRANSFORM_SNAP_SCREEN_MOVING = 2,
++};
++
++enum Snap2DTransformsItemMode : uint8_t {
++    SNAP_2D_TRANSFORMS_ITEM_INHERIT = 0,
++    SNAP_2D_TRANSFORMS_ITEM_CANVAS = 1,
++    SNAP_2D_TRANSFORMS_ITEM_SCREEN = 2,
++};
++
++// Movement detection (mode 2 only) — compared in world/canvas space per render frame
++static constexpr float SCREEN_TRANSFORM_SNAP_MOVING_EPSILON = 0.01f;
++static constexpr float SCREEN_TRANSFORM_SNAP_MOVING_JITTER_EPSILON = 0.02f;
++
++use_canvas_transform_snap(enabled, method)           // method == CANVAS only
++use_screen_transform_snap(enabled, method)           // method == SCREEN or SCREEN_MOVING (shader path enabled)
++use_screen_transform_snap_moving(enabled, method)    // method == SCREEN_MOVING only (hybrid CPU/GPU cull)
++```
++
++**Important:** The viewport method is read from the **viewport** (`snap_2d_transforms_method`), not from `GLOBAL_GET` at runtime.
++
++### 3.2. Canvas space path (viewport method == Canvas Space, or per-item override)
++
++**`renderer_canvas_cull.cpp`** — per-item origin rounding:
++
++```cpp
++if (uses_canvas_transform_snap) {
++    self_xform.columns[2] = (self_xform.columns[2] + Point2(0.5, 0.5)).floor();
++    parent_xform.columns[2] = (parent_xform.columns[2] + Point2(0.5, 0.5)).floor();
++}
++```
++
++Resolved per item via `_item_uses_canvas_transform_snap()`:
++- Viewport default: canvas space when `use_canvas_transform_snap(...)`.
++- Item override: `snap_2d_transforms_mode == CANVAS`, or inherited from parent chain.
++
++Forced screen space via `_item_uses_forced_screen_transform_snap()` (mode `2` only):
++- Item override: `snap_2d_transforms_mode == SCREEN`, or inherited from parent chain.
++- Sets both GPU flags always; skips movement detection. Canvas override on the same item wins.
++
++**`renderer_viewport.cpp`** — `_canvas_get_transform()`: `pixel_snap_offset` + `ceil` on viewport/canvas transform. Only when `use_canvas_transform_snap(...)`.
++
++### 3.3. Screen space path (shader) — critical order
++
++**Wrong** (causes jitter): snap origin **before** `canvas_transform`, or snap in `model_matrix` space only.
++
++**Correct** (current patch — mode `1` always both axes; mode `2` per-axis):
++
++```glsl
++vertex = (model_matrix * vec4(vertex, 0.0, 1.0)).xy;
++vertex = (canvas_data.canvas_transform * vec4(vertex, 0.0, 1.0)).xy;
++
++// Screen space transform snap — origin only, AFTER canvas_transform
++if (bool(canvas_data.flags & CANVAS_FLAGS_USE_TRANSFORM_PIXEL_SNAP)
++        && !bool(read_draw_data_flags & INSTANCE_FLAGS_SKIP_SCREEN_TRANSFORM_SNAP)) {
++    vec2 transform_origin = (canvas_data.canvas_transform * model_matrix * vec4(0.0, 0.0, 0.0, 1.0)).xy;
++    vec2 snapped_origin = transform_origin;
++    // Mode 1: both flags always set by cull (_finalize_screen_transform_snap_axes).
++    // Mode 2: only axes flagged as "moving" get GPU snap; static axes rely on CPU canvas snap.
++    if (bool(read_draw_data_flags & INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_X)) {
++        snapped_origin.x = floor(transform_origin.x + 0.5);
++    }
++    if (bool(read_draw_data_flags & INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_Y)) {
++        snapped_origin.y = floor(transform_origin.y + 0.5);
++    }
++    vertex += snapped_origin - transform_origin;
++    uv += 1e-5;
++}
++
++// Separate: snap_2d_vertices_to_pixel (upstream) — floor each corner; do NOT merge with screen space transform snap
++if (canvas_data.use_pixel_snap) {
++    vertex = floor(vertex + 0.5);
++    uv += 1e-5;
++}
++```
++
++**RD:** flag `CANVAS_FLAGS_USE_TRANSFORM_PIXEL_SNAP (1 << 1)` in `canvas_data.flags`.  
++**GLES3:** same meaning via `state_buffer.pad1 = 1` (without changing UBO layout).
++
++**RD instance flags:**
++
++| Flag | Bit | Meaning |
++|------|-----|---------|
++| `INSTANCE_FLAGS_SKIP_SCREEN_TRANSFORM_SNAP` | 29 | Per-item canvas override — no GPU snap |
++| `INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_X` | 30 | GPU screen snap on X (mode `2` moving axis) |
++| `INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_Y` | 31 | GPU screen snap on Y (mode `2` moving axis) |
++
++Mode `1` (Screen Space): `_finalize_screen_transform_snap_axes` sets both X/Y flags unless skipped.  
++Mode `2` (Screen Moving): flags come from cull (`screen_transform_snap_x/y` on `Item`).
++
++**Per-item opt-out of screen space snap:** `INSTANCE_FLAGS_SKIP_SCREEN_TRANSFORM_SNAP (1 << 29)` when `Item::skip_screen_transform_snap` is set (canvas space override on a screen space viewport).
++
++### 3.4. Screen Space When Moving — hybrid cull (`renderer_canvas_cull.cpp`)
++
++**Design goal:** combine canvas sharpness for world-static objects with screen snap for world-moving objects, independently per X/Y axis.
++
++#### World-space movement detection
++
++Movement is detected from **world/canvas origin**, not local `self` origin:
++
++```cpp
++world_origin = inverse(current_camera_transform) * unsnapped_final_transform.origin;
++delta = world_origin - screen_transform_snap_world_origin_prev;  // per item, per render frame
++```
++
++Why world space:
++- Autoscroll: tilemap fixed in world → stable origin → **canvas snap**, even though it moves on screen with the camera.
++- Player on moving platform: world origin changes → **GPU snap**.
++- Camera child with fixed local offset: world origin stable → canvas; use **`inherit_gpu`** from moving parent instead.
++
++Detection runs on the **unsnapped** final transform (before CPU canvas snap).
++
++Constants (`renderer_snap_2d.h`):
++
++| Constant | Value | Role |
++|----------|-------|------|
++| `SCREEN_TRANSFORM_SNAP_MOVING_EPSILON` | `0.01` | Axis counts as moving if `\|delta\| >= epsilon` |
++| `SCREEN_TRANSFORM_SNAP_MOVING_JITTER_EPSILON` | `0.02` | Secondary-axis physics jitter threshold |
++
++**Physics jitter suppression:** when **both** axes exceed `epsilon`, disable GPU on any axis whose `\|delta\|` is below `JITTER_EPSILON` (e.g. CharacterBody Y oscillating ~0.017 px while walking horizontally — do not enable GPU Y). There is no separate dominance-ratio pass; jitter threshold alone handles the common case.
++
++#### GPU vs canvas resolution (per axis)
++
++```cpp
++gpu_snap_x = inherit_gpu_snap_x || detected_moving_x;
++gpu_snap_y = inherit_gpu_snap_y || detected_moving_y;
++// Default is canvas snap when neither inherit nor detected moving on that axis.
++```
++
++**Inheritance:** only `inherit_gpu_snap_x/y` is passed to children (when parent uses GPU on that axis). There is **no** `inherit_canvas` — static children decide canvas/GPU from their own world movement.
++
++#### CPU canvas snap (static axes)
++
++When `gpu_snap_x && gpu_snap_y` → no CPU snap (GPU handles both axes in shader).
++
++When fully static (`!gpu_snap_x && !gpu_snap_y`) → **identical to mode `0`**:
++
++```cpp
++self_xform.columns[2] = (self_xform.columns[2] + Point2(0.5, 0.5)).floor();
++snapped_parent_xform.columns[2] = (snapped_parent_xform.columns[2] + Point2(0.5, 0.5)).floor();
++final_xform = snapped_parent_xform * self_xform;
++```
++
++When mixed (one axis GPU, one canvas) → per-axis floor on `self` + `snapped_parent` via `_apply_axis_canvas_transform_snap`.
++
++Y-sort path (no self/parent split): `_apply_render_origin_axis_canvas_snap` on combined `final_xform` for static axes.
++
++#### Dual parent transform chains + draw transform (critical)
++
++`_cull_canvas_item` takes **two** parent transforms plus a separate **draw** transform for attaching items:
++
++```cpp
++void _cull_canvas_item(...,
++    const Transform2D &p_snapped_parent_xform,
++    const Transform2D &p_unsnapped_parent_xform,
++    ...,
++    bool p_parent_uses_canvas_transform_snap,
++    bool p_parent_uses_forced_screen_transform_snap,
++    bool p_inherit_gpu_snap_x,
++    bool p_inherit_gpu_snap_y, ...);
++```
++
++Root call: both parent chains start as the camera/canvas transform; forced-screen parent flag is `false`.
++
++Per item (mode `2`, non-canvas-override):
++
++```cpp
++unsnapped_final = p_unsnapped_parent * self;
++// detect + resolve gpu flags on unsnapped_final (skipped when forced screen)
++// CPU canvas snap → final_xform (hybrid final with per-level static-axis rounding)
++
++// Children:
++child_snapped_parent   = final_xform;          // ALWAYS — cumulative canvas snap on static axes
++child_unsnapped_parent = unsnapped_final;      // movement detection only
++
++// Draw attach (NOT final_xform directly in mixed-axis cases):
++draw_xform = _build_screen_transform_snap_draw_xform(
++    final_xform, unsnapped_final, gpu_snap_x, gpu_snap_y);
++```
++
++**Why two chains:** a **static ancestor** (e.g. Level at fractional X) must pass **cumulative canvas-snapped** transforms to static descendants (tilemap). The **unsnapped** chain is kept separately so movement detection is not poisoned by CPU canvas snap. GPU siblings still compose from unsnapped for moving axes at draw time.
++
++**Why `draw_xform` ≠ `final_xform` in mixed-axis mode:** passing only `unsnapped_final` to children loses per-level canvas snap on static axes (e.g. Path2D parent at X = -1888.4). Passing only `final_xform` to draw quantizes the moving axis in CPU space before the GPU shader runs. `_build_screen_transform_snap_draw_xform` fixes both:
++
++```cpp
++// Both GPU → unsnapped (shader snaps both axes)
++// Both static → final (CPU already snapped)
++// Mixed → unsnapped chain, but copy static-axis origin from hybrid final:
++draw_origin.x = gpu_snap_x ? unsnapped.origin.x : final.origin.x;
++draw_origin.y = gpu_snap_y ? unsnapped.origin.y : final.origin.y;
++```
++
++`_attach_canvas_item_for_draw` and `global_rect` use **`draw_xform`**, not `final_xform`.
++
++**Forced screen** (`snap_2d_transforms_mode == Screen Space`, or `has_particles`, mode `2` only): both GPU flags always; `final_xform = unsnapped_final`; `draw_xform = unsnapped_final`; `child_inherit_gpu_snap_x/y = true`; no dual-chain special case for unsnapped parent (both chains equal unsnapped).
++
++#### `Item` fields (`renderer_canvas_render.h`)
++
++```cpp
++bool screen_transform_snap_x = false;              // GPU output → instance flag X
++bool screen_transform_snap_y = false;              // GPU output → instance flag Y
++bool screen_transform_snap_world_origin_valid = false;
++Point2 screen_transform_snap_world_origin_prev;    // detection only (world space)
++```
++
++#### Cull helpers (`renderer_canvas_cull.h`)
++
++| Function | Role |
++|----------|------|
++| `_detect_screen_transform_snap_axes` | World-origin delta → `moving_x/y`; jitter suppression |
++| `_resolve_screen_transform_snap_axes` | `gpu = inherit \|\| moving` per axis |
++| `_apply_screen_transform_snap_moving` | Detect + resolve; writes `screen_transform_snap_x/y` |
++| `_apply_hybrid_canvas_transform_snap` | CPU canvas snap for static axes |
++| `_apply_axis_canvas_transform_snap` | Per-axis self + parent floor |
++| `_apply_render_origin_axis_canvas_snap` | Y-sort fallback on combined final |
++| `_get_screen_transform_snap_world_origin` | `inverse(camera) * final.origin` |
++| `_build_screen_transform_snap_draw_xform` | Mixed-axis draw transform (unsnapped + static origin from final) |
++| `_item_uses_canvas_transform_snap` | Per-item canvas override + inherit |
++| `_item_uses_forced_screen_transform_snap` | Per-item forced GPU both axes + inherit (mode `2`) |
++| `_finalize_screen_transform_snap_axes` | Mode `1`: force both GPU flags; mode `2`: leave cull flags |
++
++#### Viewport cull flags
++
++```cpp
++_viewport_uses_canvas_transform_snap      // mode == 0
++_viewport_uses_screen_transform_snap     // mode == 1 or 2 (shader enabled)
++_viewport_uses_screen_transform_snap_moving  // mode == 2 only (hybrid cull)
++```
++
++### 3.5. Parameter plumbing
++
++`canvas_render_items` receives an additional argument:
++
++```cpp
++bool p_snap_2d_transforms_to_pixel,
++bool p_snap_2d_vertices_to_pixel,
++uint8_t p_snap_2d_transforms_method,  // 0 = Canvas, 1 = Screen, 2 = Screen When Moving
++```
++
++Call chain:
++
++```
++RendererViewport (draw)
++  → RendererCanvasCull::render_canvas(..., method)
++    → _render_canvas_item_tree(..., method)
++      → canvas_render_items(..., method)
++        → state: flags / pad1 for screen space snap
++        → per-item: skip_screen_transform_snap → INSTANCE_FLAGS_SKIP_SCREEN_TRANSFORM_SNAP
++        → per-item (mode 2): screen_transform_snap_x/y → INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_X/Y
++```
++
++When forward-porting, search for: `snap_2d_transforms_method`, `render_canvas`, `canvas_render_items`, `skip_screen_transform_snap`, `screen_transform_snap`, `_viewport_uses_screen_transform_snap_moving`, `child_snapped_parent_xform`, `draw_xform`, `_build_screen_transform_snap_draw_xform`, `_item_uses_forced_screen_transform_snap`.
++
++### 3.6. Viewport / Scene
++
++**`viewport.h`:**
++
++- Enum `Snap2DTransformsMethod`: `SNAP_2D_TRANSFORMS_METHOD_CANVAS` (0), `SNAP_2D_TRANSFORMS_METHOD_SCREEN` (1), `SNAP_2D_TRANSFORMS_METHOD_SCREEN_MOVING` (2).
++- `VARIANT_ENUM_CAST(Viewport::Snap2DTransformsMethod);` at end of file (**required**, otherwise C2027 on `BIND_ENUM_CONSTANT`).
++- `set/get_snap_2d_transforms_method`, `is_snap_2d_transforms_to_pixel_canvas_enabled()`, `is_snap_2d_transforms_to_pixel_screen_enabled()`.
++
++**`canvas_item.h`:**
++
++- Enum `Snap2DTransformsMode`: `SNAP_2D_TRANSFORMS_MODE_INHERIT` (0), `SNAP_2D_TRANSFORMS_MODE_CANVAS` (1), `SNAP_2D_TRANSFORMS_MODE_SCREEN` (2).
++- `VARIANT_ENUM_CAST(CanvasItem::Snap2DTransformsMode);`
++- `set/get_snap_2d_transforms_mode`, `is_snap_2d_transforms_canvas_space_in_tree()`.
++- Property `snap_2d_transforms_mode` — **Inherit** / **Canvas Space** / **Screen Space**; propagates to children with Inherit.
++
++**`RenderingServer`:**
++
++- `viewport_set_snap_2d_transforms_method(RID, int)`
++- `canvas_item_set_snap_2d_transforms_mode(RID, int)`
++
++**Parallax2D:** offset workaround — only `is_snap_2d_transforms_to_pixel_canvas_enabled()`, **not** for screen space.
++
++**Sprite2D / AnimatedSprite2D / RichTextLabel:** `(offset + 0.5).floor()` when `is_snap_2d_transforms_to_pixel_enabled()`.
++
++**CPUParticles2D / GPUParticles2D:** mesh vertex offset `(dest_offset + 0.5).floor()` when screen space snap is active and the item does **not** use canvas space in tree.
++
++**GPUParticles2D (mode `2` only):** canvas items with a particles draw command set `has_particles`; `_item_uses_forced_screen_transform_snap` treats them like per-item **Screen Space** — always GPU snap on both axes, no movement detection. Per-item **Canvas Space** override still wins.
++
++---
++
++## 4. Forward-port workflow
++
++### Step 1 — Preparation
++
++```bash
++git fetch origin
++git checkout -b pixel-snap-screen origin/4.x   # or target stable tag
++git log --oneline -1                            # record target version
++```
++
++Save the patch from the base version:
++
++```bash
++git format-patch <base-commit>..<patch-tip> -o patches/pixel-snap-screen/
++# or
++git diff <upstream-stable>..<patch-branch> > patches/pixel-snap-screen.patch
++```
++
++### Step 2 — Cherry-pick / apply
++
++```bash
++git cherry-pick <commit>    # preferred if there is a dedicated commit
++# or
++git apply --3way patches/pixel-snap-screen.patch
++```
++
++### Step 3 — Conflict resolution
++
++Use **section 5** below. After each block, run `grep` on key symbols (section 6).
++
++### Step 4 — Integrity check
++
++```bash
++rg "snap_2d_transforms_method|CANVAS_FLAGS_USE_TRANSFORM_PIXEL_SNAP|RendererSnap2D|skip_screen_transform_snap" --type-add 'godot:*.{cpp,h,glsl}' -t godot
++rg "canvas_render_items\(" servers/rendering drivers/gles3 -A1
++```
++
++Ensure **all** `canvas_render_items` implementations share the same signature (RD, GLES3, dummy).
++
++### Step 5 — Functional checklist
++
++- [ ] SubViewport: `snap_2d_transforms_to_pixel = on`, `method = Screen Space`, `vertices = off`
++- [ ] SubViewport hybrid: `method = Screen Space When Moving` — static tilemap sharp at fractional positions during autoscroll; moving player/platform use GPU snap
++- [ ] No ±1 px jitter: player on moving platform + camera follow + physics interpolation
++- [ ] Horizontal walk on sloped/smooth camera rise: no vertical jitter from physics Y oscillation (~0.017 px) falsely enabling GPU Y
++- [ ] Sprites are not stretched (unlike `vertices = on`)
++- [ ] Centered Sprite2D with odd dimensions — no extra blur (offset snap)
++- [ ] Particles — sharp textures in screen space mode (mesh offset)
++- [ ] GPUParticles2D on mode `2` viewport — always GPU screen snap even when emitter is static; `Canvas Space` per-item override still works
++- [ ] Canvas Space mode (`method = Canvas Space`) — matches upstream canvas space behavior (regression)
++- [ ] Screen Space mode (`method = Screen Space`) — always GPU snap both axes (regression)
++- [ ] Per-item `snap_2d_transforms_mode = Canvas Space` on screen space viewport — no screen space shader shift
++- [ ] Per-item `snap_2d_transforms_mode = Screen Space` on mode `2` viewport — always GPU both axes without movement detection; children with Inherit follow
++- [ ] Mode `2` mixed-axis: object moving on one axis only gets GPU on that axis; static axis keeps canvas snap (Path2D at fractional X + moving child)
++- [ ] Mode `2` per-axis: movement on X only does not enable GPU Y (and vice versa)
++- [ ] Parallax2D unchanged in screen space mode (workaround inactive)
++- [ ] GPU sibling (player) not affected by static ancestor canvas-snapping the camera into parent chain
++- [ ] `_attach_canvas_item_for_draw` uses `draw_xform`, not raw `final_xform`, in mixed-axis hybrid
++
++---
++
++## 5. Conflict resolution by area
++
++### 5.1. `renderer_viewport.cpp` — `_canvas_get_transform`
++
++Upstream often changes camera/viewport rounding.
++
++| On conflict | Action |
++|-------------|--------|
++| Upstream added new snap/round logic | Wrap the **entire** block in `if (RendererSnap2D::use_canvas_transform_snap(...))` |
++| Upstream renamed variables | Keep upstream names; keep canvas-space-only guard |
++| Upstream removed viewport snap | Do **not** restore it for screen space; for canvas space — port patch logic |
++
++**Do not:** apply canvas space viewport rounding when `method == Screen Space` — jitter returns.
++
++### 5.2. `renderer_canvas_cull.cpp`
++
++| On conflict | Action |
++|-------------|--------|
++| Physics interpolation block changed | Rounding stays **after** interpolation; per-item via `uses_canvas_transform_snap` |
++| Y-sort / transform compose changed | Preserve `_item_uses_canvas_transform_snap`, `_item_uses_forced_screen_transform_snap`, `skip_screen_transform_snap`, dual parent xforms, **`draw_xform`** |
++| New `render_canvas` parameter | Add `p_snap_2d_transforms_method` and pass it through |
++| `_cull_canvas_item` signature changed | Restore **two** parent transforms + **`p_parent_uses_forced_screen_transform_snap`**; restore `_build_screen_transform_snap_draw_xform` for draw attach |
++| Movement detection touched | Preserve world-origin detection, jitter suppression (epsilon + jitter only), `inherit_gpu` only (no `inherit_canvas`) |
++
++### 5.3. `canvas_render_items` signature
++
++Typical conflict: upstream added a parameter in the middle of the list.
++
++**Rule:** `p_snap_2d_transforms_method` goes after `p_snap_2d_vertices_to_pixel`, before `r_sdf_used`. Update **all** overrides: RD, GLES3, dummy, virtual in `renderer_canvas_render.h`.
++
++### 5.4. Shaders (`canvas.glsl`)
++
++| On conflict | Action |
++|-------------|--------|
++| Upstream changed vertex transform order | Place screen space snap **after** `canvas_transform`, **before** `use_pixel_snap` |
++| Upstream changed per-instance flags layout | Preserve bits 29–31: SKIP, SNAP_X, SNAP_Y |
++| Upstream changed `canvas_data` UBO | RD: use a bit in `flags`; do not add std140 fields without alignment |
++| GLES3: `CanvasData` changed | Screen space flag via `pad1`; do not break `StateBuffer` sizeof |
++| Upstream rewrote backend | Find canvas item vertex shader equivalent; reproduce the same operation order |
++
++**Do not:**
++
++- Move screen space transform snap **before** `canvas_transform` (jitter returns).
++- Merge screen space transform snap with `use_pixel_snap` / `snap_2d_vertices_to_pixel`.
++- Forget `INSTANCE_FLAGS_SKIP_SCREEN_TRANSFORM_SNAP` guard for per-item canvas space override.
++- Forget per-axis `INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_X/Y` for mode `2`.
++
++### 5.5. `viewport.cpp` / bindings
++
++On conflict in `_bind_methods`:
++
++1. Restore `BIND_ENUM_CONSTANT(SNAP_2D_TRANSFORMS_METHOD_CANVAS/SCREEN/SCREEN_MOVING)`.
++2. Verify `VARIANT_ENUM_CAST(Viewport::Snap2DTransformsMethod)` in `viewport.h`.
++3. `ADD_PROPERTY` for `snap_2d_transforms_method` next to `snap_2d_transforms_to_pixel`.
++
++**`canvas_item.cpp`:**
++
++1. `BIND_ENUM_CONSTANT(SNAP_2D_TRANSFORMS_MODE_INHERIT/CANVAS/SCREEN/MAX)`.
++2. `VARIANT_ENUM_CAST(CanvasItem::Snap2DTransformsMode)` in `canvas_item.h`.
++
++### 5.6. Documentation XML
++
++Conflicts in `doc/classes/*.xml` — merge upstream text with new members:
++
++- `Viewport.snap_2d_transforms_method` + enum constants `SNAP_2D_TRANSFORMS_METHOD_CANVAS` / `SCREEN` / `SCREEN_MOVING`
++- `CanvasItem.snap_2d_transforms_mode` + enum constants `SNAP_2D_TRANSFORMS_MODE_*`
++- `ProjectSettings.rendering/2d/snap/snap_2d_transforms_method`
++
++Property key names: `0` = canvas, `1` = screen, `2` = screen when moving.
++
++---
++
++## 6. Grep anchors after upstream refactors
++
++```bash
++rg "snap_2d_transforms_to_pixel" servers/rendering scene/main
++rg "_canvas_get_transform" servers/rendering/renderer_viewport.cpp
++rg "use_canvas_transform_snap|use_screen_transform_snap|use_screen_transform_snap_moving" servers/rendering
++rg "_item_uses_canvas_transform_snap|_item_uses_forced_screen_transform_snap|skip_screen_transform_snap|screen_transform_snap" servers/rendering
++rg "_detect_screen_transform_snap|_build_screen_transform_snap_draw_xform|_apply_hybrid_canvas|child_snapped_parent|draw_xform" servers/rendering
++rg "use_pixel_snap" servers/rendering/renderer_rd drivers/gles3
++rg "INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP" servers/rendering/renderer_rd/shaders drivers/gles3/shaders
++rg "INSTANCE_FLAGS_SKIP_SCREEN_TRANSFORM_SNAP|INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP" servers/rendering drivers/gles3
++rg "canvas_render_items" servers/rendering drivers/gles3
++rg "VARIANT_ENUM_CAST\(Viewport::" scene/main/viewport.h
++rg "VARIANT_ENUM_CAST\(CanvasItem::" scene/main/canvas_item.h
++rg "snap_2d_transforms_mode" scene/main
++```
++
++If upstream renamed `RendererCanvasRenderRD` or split files, search for `final_transform`, `canvas_transform_inverse`, `CANVAS_FLAGS_CONVERT_ATTRIBUTES_TO_LINEAR`.
++
++---
++
++## 7. Common merge mistakes
++
++1. **Screen space snap before camera** — jitter returns.
++2. **Canvas space snap not guarded by method / per-item resolution** — double snap or jitter.
++3. **Forgot dummy/GLES3** after virtual signature change — link error.
++4. **Missing `VARIANT_ENUM_CAST`** — `error C2027` on `BIND_ENUM_CONSTANT`.
++5. **Merged transform snap and vertex snap into one flag** — stretch or blur.
++6. **Sprite offset snap missing** — blur on centered sprites in screen space mode.
++7. **Parallax workaround enabled for screen space** — unwanted artifacts.
++8. **Edited `.glsl` only, forgot `.gen.h`** — CI/build mismatch without regen.
++9. **Missing `INSTANCE_FLAGS_SKIP_SCREEN_TRANSFORM_SNAP`** — per-item canvas space override has no effect.
++10. **Particle mesh not adjusted for screen space** — blurred particle textures.
++11. **Mode `2`: single parent chain only** — static descendants lose canvas snap, or GPU siblings get camera-snapped parent (Mario jitter on platform).
++12. **Mode `2`: `child_snapped_parent = unsnapped` when any GPU axis** — loses cumulative per-level canvas snap on static axes for descendants (fractional Path2D parent).
++13. **Mode `2`: draw attach uses `final_xform` instead of `draw_xform`** — mixed-axis moving axis quantized in CPU before GPU shader; per-axis snap broken.
++14. **Mode `2`: movement detected in local space instead of world** — autoscroll platform sprites miss GPU; tilemap false-moving.
++15. **Mode `2`: `inherit_canvas` reintroduced** — static parent forces canvas on all descendants including moving children.
++16. **Mode `2`: world snap on final instead of self+parent canvas snap** — static objects blurred (camera subpixel not handled like mode `0`).
++17. **Mode `2`: physics Y jitter (~0.017) enables GPU Y during horizontal walk** — vertical jitter with rising camera; jitter epsilon must stay ≥ typical floor oscillation.
++18. **Mode `2`: `_finalize_screen_transform_snap_axes` overwrites per-axis flags** — must leave flags from cull when `use_screen_transform_snap_moving`.
++19. **Mode `2`: child GPU inherit uses `\|\|` instead of per-axis assignment from parent flags** — GPU snap only when both axes move simultaneously.
++
++---
++
++## 8. Minimal manual recovery (if patch does not apply)
++
++If automerge fails completely, restore in this order:
++
++1. Add `servers/rendering/renderer_snap_2d.h`
++2. Viewport enum + RS API + `RendererViewport::snap_2d_transforms_method`
++3. CanvasItem enum + `canvas_item_set_snap_2d_transforms_mode`
++4. Guard canvas space snap (cull + viewport) with per-item resolution
++5. Extend `canvas_render_items` + pass `method`
++6. RD: `CANVAS_FLAGS_USE_TRANSFORM_PIXEL_SNAP` + shader block + skip + per-axis snap flags
++7. GLES3: `pad1` + shader block + skip + per-axis snap flags
++8. Mode `2`: hybrid cull (world detection, dual parent chains, **`draw_xform`**, `inherit_gpu`, CPU canvas snap helpers, per-item forced screen)
++9. Scene: viewport/canvas_item properties, scene_tree/editor_node init, sprite/particle offsets
++10. Docs + enum constants in XML
++
++---
++
++## 9. Upstream context
++
++| Mode | Behavior |
++|------|----------|
++| **Canvas Space** (default, int `0`) | Rounds transform origins in canvas space on the CPU, including viewport transform |
++| **Screen Space** (int `1`) | Always rounds transform origins in screen space on the GPU after `canvas_transform` (both axes) |
++| **Screen Space When Moving** (int `2`) | Hybrid per axis: world-static → CPU canvas snap (mode `0` equivalent); world-moving → GPU screen snap; dual parent chains + **`draw_xform`** during cull |
++| **Per-item Canvas Space** | Forces canvas space rounding for a subtree; disables screen space shader shift via `INSTANCE_FLAGS_SKIP_SCREEN_TRANSFORM_SNAP` |
++| **Per-item Screen Space** | Forces GPU screen snap on both axes without movement detection (mode `2` only); children with Inherit follow |
++
++### Mode `2` reference scenario (autoscroll platformer)
++
++Typical scene (MF Community Edition):
++
++```
++Level (Node2D, static in world)
++├── Mario / enemies (move in world → GPU snap)
++├── PathFollow2D + Camera2D + platform (move in world → GPU snap, inherit_gpu to children)
++└── TileMapLayer (fixed world coords → canvas snap, sharp vs fractional tile positions)
++```
++
++Movement detection uses **render frames** (not physics ticks): `screen_transform_snap_world_origin_prev` updates each viewport draw.
++
++This patch does **not** replace upstream `snap_2d_vertices_to_pixel` — that remains a separate option.
++
++---
++
++## 10. Suggested commit / PR message
++
++```
++Add screen space modes for 2D transform pixel snapping
++
++Introduce snap_2d_transforms_method (Canvas Space / Screen Space /
++Screen Space When Moving) on Viewport and RenderingServer. Screen Space
++rounds transform origins in the canvas shader after the camera transform.
++Screen Space When Moving hybridizes CPU canvas snap for world-static
++objects with per-axis GPU screen snap for world-moving objects, using
++world-origin detection, dual parent transform chains, draw_xform for
++mixed-axis attach, and inherit_gpu. Add CanvasItem.snap_2d_transforms_mode
++for per-item canvas/screen space overrides (Inherit / Canvas Space /
++Screen Space).
++```
++
++---
++
++*This document applies to the fork/patch based on Godot 4.7. Update the **Patch base version** section after a successful forward-port.*
+diff --git a/doc/classes/CanvasItem.xml b/doc/classes/CanvasItem.xml
+index 2c5fdae8fdcc2069c6480511bb3ac0d3b33bf360..e45741c8445da0760749aa31cb111830f92f6d42 100644
+--- a/doc/classes/CanvasItem.xml
++++ b/doc/classes/CanvasItem.xml
+@@ -685,6 +685,12 @@
+ 			The repeating mode used to render this [CanvasItem]'s texture(s). It affects what happens when the texture is sampled outside its extents, for example by setting a [member Sprite2D.region_rect] that is larger than the texture or assigning [Polygon2D] UV points outside the texture.
+ 			[b]Note:[/b] [TextureRect] is not affected by [member texture_repeat], as it uses its own texture repeating implementation.
+ 		</member>
++		<member name="snap_2d_transforms_mode" type="int" setter="set_snap_2d_transforms_mode" getter="get_snap_2d_transforms_mode" enum="CanvasItem.Snap2DTransformsMode" default="0">
++			Overrides how [member Viewport.snap_2d_transforms_to_pixel] is resolved for this node and its descendants.
++			[b]Inherit:[/b] Use the mode resolved from the parent [CanvasItem], or from the [Viewport] for root items.
++			[b]Canvas Space:[/b] Always round transform origins in canvas space. When the viewport uses screen space snapping, the item is not shifted by the canvas shader in screen space.
++			[b]Screen Space:[/b] Always apply screen space pixel snapping on both axes, without movement detection. Only effective when the viewport uses [constant Viewport.SNAP_2D_TRANSFORMS_METHOD_SCREEN_MOVING]. Children with [constant SNAP_2D_TRANSFORMS_MODE_INHERIT] inherit this behavior.
++		</member>
+ 		<member name="top_level" type="bool" setter="set_as_top_level" getter="is_set_as_top_level" default="false">
+ 			If [code]true[/code], this [CanvasItem] will [i]not[/i] inherit its transform from parent [CanvasItem]s. Its draw order will also be changed to make it draw on top of other [CanvasItem]s that do not have [member top_level] set to [code]true[/code]. The [CanvasItem] will effectively act as if it was placed as a child of a bare [Node].
+ 		</member>
+@@ -830,5 +836,17 @@
+ 		<constant name="OVERSAMPLING_WITH_SCALE_MAX" value="3" enum="OversamplingWithScale">
+ 			Represents the size of the [enum OversamplingWithScale] enum.
+ 		</constant>
++		<constant name="SNAP_2D_TRANSFORMS_MODE_INHERIT" value="0" enum="Snap2DTransformsMode">
++			Inherit the resolved transform snap mode from the parent [CanvasItem], or from the [Viewport] for root items.
++		</constant>
++		<constant name="SNAP_2D_TRANSFORMS_MODE_CANVAS" value="1" enum="Snap2DTransformsMode">
++			Always round transform origins in canvas space. When the viewport uses screen space snapping, the item is not shifted by the canvas shader in screen space.
++		</constant>
++		<constant name="SNAP_2D_TRANSFORMS_MODE_SCREEN" value="2" enum="Snap2DTransformsMode">
++			Always apply screen space pixel snapping on both axes, without movement detection. Only effective when the viewport uses [constant Viewport.SNAP_2D_TRANSFORMS_METHOD_SCREEN_MOVING]. Children with [constant SNAP_2D_TRANSFORMS_MODE_INHERIT] inherit this behavior.
++		</constant>
++		<constant name="SNAP_2D_TRANSFORMS_MODE_MAX" value="3" enum="Snap2DTransformsMode">
++			Represents the size of the [enum Snap2DTransformsMode] enum.
++		</constant>
+ 	</constants>
+ </class>
+diff --git a/doc/classes/ProjectSettings.xml b/doc/classes/ProjectSettings.xml
+index 14e3133aee36921fd80484eb70b2ae525aa02e32..f70c698e187cb43f35fdfb774f751043e3a90381 100644
+--- a/doc/classes/ProjectSettings.xml
++++ b/doc/classes/ProjectSettings.xml
+@@ -2845,10 +2845,18 @@
+ 			[b]Note:[/b] This property is only read when the project starts. To change the 2D shadow atlas size at runtime, use [method RenderingServer.canvas_set_shadow_texture_size] instead.
+ 		</member>
+ 		<member name="rendering/2d/snap/snap_2d_transforms_to_pixel" type="bool" setter="" getter="" default="false">
+-			If [code]true[/code], [CanvasItem] nodes will internally snap to full pixels. Useful for low-resolution pixel art games. Their position can still be sub-pixel, but the decimals will not have effect as the position is rounded. This can lead to a crisper appearance at the cost of less smooth movement, especially when [Camera2D] smoothing is enabled.
++			If [code]true[/code], [CanvasItem] transform origins are aligned to the pixel grid when rendered. Useful for low-resolution pixel art. Node positions may remain sub-pixel in the scene tree, but fractional offsets do not affect the final draw position. This improves crispness at the cost of less smooth motion, especially with [Camera2D] smoothing enabled.
+ 			[b]Note:[/b] This property is only read when the project starts. To toggle 2D transform snapping at runtime, use [method RenderingServer.viewport_set_snap_2d_transforms_to_pixel] on the root [Viewport] instead.
+ 			[b]Note:[/b] [Control] nodes are snapped to the nearest pixel by default. This is controlled by [member gui/common/snap_controls_to_pixels].
+ 			[b]Note:[/b] It is not recommended to use this setting together with [member rendering/2d/snap/snap_2d_vertices_to_pixel], as movement may appear even less smooth. Prefer only enabling this setting instead.
++			[b]Note:[/b] See [member rendering/2d/snap/snap_2d_transforms_method] to choose between canvas space and screen space rounding. The same option is available per [Viewport] as [member Viewport.snap_2d_transforms_method].
++		</member>
++		<member name="rendering/2d/snap/snap_2d_transforms_method" type="int" setter="" getter="" default="0">
++			Selects how [member rendering/2d/snap/snap_2d_transforms_to_pixel] rounds transform origins when enabled on the root [Viewport] at project startup.
++			[b]Canvas Space (Default):[/b] Rounds origins in canvas space on the CPU, including the viewport transform. Motion is quantized in world space, which can introduce one-pixel variation with physics interpolation or scrolling cameras.
++			[b]Screen Space:[/b] Rounds origins in screen space on the GPU after the canvas transform is applied. Sub-pixel motion is preserved in canvas space while the rendered output stays on the pixel grid. Recommended for pixel art with moving platforms and physics interpolation. Per-item canvas space rounding is available through [member CanvasItem.snap_2d_transforms_mode].
++			[b]Screen Space When Moving:[/b] Like [b]Screen Space[/b], but only snaps axes where the item's canvas-space origin moved since the previous frame. Static items in canvas space are not snapped, which keeps backgrounds sharp when the camera moves.
++			[b]Note:[/b] This property is only read when the project starts and applies to the root [Viewport]. For [SubViewport] nodes, use [member Viewport.snap_2d_transforms_method] instead.
+ 		</member>
+ 		<member name="rendering/2d/snap/snap_2d_vertices_to_pixel" type="bool" setter="" getter="" default="false">
+ 			If [code]true[/code], vertices of [CanvasItem] nodes will snap to full pixels. Useful for low-resolution pixel art games. Only affects the final vertex positions, not the transforms. This can lead to a crisper appearance at the cost of less smooth movement, especially when [Camera2D] smoothing is enabled.
+diff --git a/doc/classes/Viewport.xml b/doc/classes/Viewport.xml
+index 92e58a5a6cbab84965c7b07f471e280f600f17c7..6d4f868737aea11407e9b48a4d5109ef1aecf124 100644
+--- a/doc/classes/Viewport.xml
++++ b/doc/classes/Viewport.xml
+@@ -446,7 +446,13 @@
+ 			The resolution scale to use for the 2D signed distance field. Higher values lead to a more precise and more stable signed distance field as the camera moves, at the cost of performance.
+ 		</member>
+ 		<member name="snap_2d_transforms_to_pixel" type="bool" setter="set_snap_2d_transforms_to_pixel" getter="is_snap_2d_transforms_to_pixel_enabled" default="false">
+-			If [code]true[/code], [CanvasItem] nodes will internally snap to full pixels. Their position can still be sub-pixel, but the decimals will not have effect. This can lead to a crisper appearance at the cost of less smooth movement, especially when [Camera2D] smoothing is enabled.
++			If [code]true[/code], [CanvasItem] transform origins are aligned to the pixel grid when rendered. Node positions may remain sub-pixel in the scene tree, but fractional offsets do not affect the final draw position. This improves crispness for pixel art at the cost of less smooth motion, especially with [Camera2D] smoothing enabled. Use [member snap_2d_transforms_method] to choose between canvas space and screen space rounding.
++		</member>
++		<member name="snap_2d_transforms_method" type="int" setter="set_snap_2d_transforms_method" getter="get_snap_2d_transforms_method" enum="Viewport.Snap2DTransformsMethod" default="0">
++			Selects how [member snap_2d_transforms_to_pixel] rounds transform origins when enabled.
++			[b]Canvas Space (Default):[/b] Rounds origins in canvas space on the CPU, including the viewport transform. Motion is quantized in world space, which can introduce one-pixel variation with physics interpolation or scrolling cameras.
++			[b]Screen Space:[/b] Rounds origins in screen space on the GPU after the canvas transform is applied. Sub-pixel motion is preserved in canvas space while the rendered output stays on the pixel grid. Recommended for pixel art with moving platforms and physics interpolation. Per-item canvas space rounding is available through [member CanvasItem.snap_2d_transforms_mode].
++			[b]Screen Space When Moving:[/b] Like [b]Screen Space[/b], but only snaps axes where the item's canvas-space origin moved since the previous frame. Static items in canvas space are not snapped, which keeps backgrounds sharp when the camera moves.
+ 		</member>
+ 		<member name="snap_2d_vertices_to_pixel" type="bool" setter="set_snap_2d_vertices_to_pixel" getter="is_snap_2d_vertices_to_pixel_enabled" default="false">
+ 			If [code]true[/code], vertices of [CanvasItem] nodes will snap to full pixels. Only affects the final vertex positions, not the transforms. This can lead to a crisper appearance at the cost of less smooth movement, especially when [Camera2D] smoothing is enabled.
+@@ -853,5 +859,14 @@
+ 		<constant name="VRS_UPDATE_MAX" value="3" enum="VRSUpdateMode">
+ 			Represents the size of the [enum VRSUpdateMode] enum.
+ 		</constant>
++		<constant name="SNAP_2D_TRANSFORMS_METHOD_CANVAS" value="0" enum="Snap2DTransformsMethod">
++			Round transform origins in canvas space on the CPU. Can introduce one-pixel variation when combined with physics interpolation or scrolling cameras.
++		</constant>
++		<constant name="SNAP_2D_TRANSFORMS_METHOD_SCREEN" value="1" enum="Snap2DTransformsMethod">
++			Round transform origins in screen space on the GPU after the canvas transform is applied. Per-item canvas space rounding is available through [member CanvasItem.snap_2d_transforms_mode].
++		</constant>
++		<constant name="SNAP_2D_TRANSFORMS_METHOD_SCREEN_MOVING" value="2" enum="Snap2DTransformsMethod">
++			Round transform origins in screen space on the GPU, but only on axes where the item's canvas-space origin moved since the previous frame.
++		</constant>
+ 	</constants>
+ </class>
+diff --git a/drivers/gles3/rasterizer_canvas_gles3.cpp b/drivers/gles3/rasterizer_canvas_gles3.cpp
+index 3b570522c95561f7f8186fad781894265adae3bb..6a10f0ee4588802f1b0cd00d7632618a72a1e25d 100644
+--- a/drivers/gles3/rasterizer_canvas_gles3.cpp
++++ b/drivers/gles3/rasterizer_canvas_gles3.cpp
+@@ -41,6 +41,7 @@
+ #include "drivers/gles3/storage/mesh_storage.h"
+ #include "drivers/gles3/storage/particles_storage.h"
+ #include "drivers/gles3/storage/texture_storage.h"
++#include "servers/rendering/renderer_snap_2d.h"
+ #include "drivers/gles3/storage/utilities.h"
+ #include "servers/rendering/rendering_server_default.h"
+ #include "servers/rendering/rendering_server_globals.h"
+@@ -105,7 +106,7 @@ void RasterizerCanvasGLES3::_update_transform_to_mat4(const Transform3D &p_trans
+ 	p_mat4[15] = 1;
+ }
+ 
+-void RasterizerCanvasGLES3::canvas_render_items(RID p_to_render_target, Item *p_item_list, const Color &p_modulate, Light *p_light_list, Light *p_directional_light_list, const Transform2D &p_canvas_transform, RSE::CanvasItemTextureFilter p_default_filter, RSE::CanvasItemTextureRepeat p_default_repeat, bool p_snap_2d_vertices_to_pixel, bool &r_sdf_used, RenderingServerTypes::RenderInfo *r_render_info) {
++void RasterizerCanvasGLES3::canvas_render_items(RID p_to_render_target, Item *p_item_list, const Color &p_modulate, Light *p_light_list, Light *p_directional_light_list, const Transform2D &p_canvas_transform, RSE::CanvasItemTextureFilter p_default_filter, RSE::CanvasItemTextureRepeat p_default_repeat, bool p_snap_2d_transforms_to_pixel, bool p_snap_2d_vertices_to_pixel, uint8_t p_snap_2d_transforms_method, bool &r_sdf_used, RenderingServerTypes::RenderInfo *r_render_info) {
+ 	GLES3::TextureStorage *texture_storage = GLES3::TextureStorage::get_singleton();
+ 	GLES3::MaterialStorage *material_storage = GLES3::MaterialStorage::get_singleton();
+ 	GLES3::MeshStorage *mesh_storage = GLES3::MeshStorage::get_singleton();
+@@ -352,6 +353,7 @@ void RasterizerCanvasGLES3::canvas_render_items(RID p_to_render_target, Item *p_
+ 
+ 		state_buffer.time = state.time;
+ 		state_buffer.use_pixel_snap = p_snap_2d_vertices_to_pixel;
++		state_buffer.pad1 = RendererSnap2D::use_screen_transform_snap(p_snap_2d_transforms_to_pixel, (RendererSnap2D::TransformSnapMethod)p_snap_2d_transforms_method) ? 1 : 0;
+ 
+ 		state_buffer.directional_light_count = directional_light_count;
+ 
+@@ -868,6 +870,16 @@ void RasterizerCanvasGLES3::_record_item_commands(const Item *p_item, RID p_rend
+ 		base_flags |= shadow_mask << INSTANCE_FLAGS_SHADOW_MASKED_SHIFT;
+ 	}
+ 
++	if (p_item->skip_screen_transform_snap) {
++		base_flags |= INSTANCE_FLAGS_SKIP_SCREEN_TRANSFORM_SNAP;
++	}
++	if (p_item->screen_transform_snap_x) {
++		base_flags |= INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_X;
++	}
++	if (p_item->screen_transform_snap_y) {
++		base_flags |= INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_Y;
++	}
++
+ 	bool lights_disabled = light_count == 0 && !state.using_directional_lights;
+ 
+ 	if (lights_disabled != bool(state.canvas_instance_batches[state.current_batch_index].specialization & CanvasShaderGLES3::DISABLE_LIGHTING)) {
+diff --git a/drivers/gles3/rasterizer_canvas_gles3.h b/drivers/gles3/rasterizer_canvas_gles3.h
+index 6874d5d310efd5e7e990e51ba1f0d5cd0d0343df..981db22bccb890b204a28d705ef6030ced59c297 100644
+--- a/drivers/gles3/rasterizer_canvas_gles3.h
++++ b/drivers/gles3/rasterizer_canvas_gles3.h
+@@ -60,6 +60,9 @@ class RasterizerCanvasGLES3 : public RendererCanvasRender {
+ 		INSTANCE_FLAGS_NINEPATCH_V_MODE_SHIFT = 11,
+ 
+ 		INSTANCE_FLAGS_SHADOW_MASKED_SHIFT = 13, // 16 bits.
++		INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_X = (1 << 30),
++		INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_Y = (1 << 31),
++		INSTANCE_FLAGS_SKIP_SCREEN_TRANSFORM_SNAP = (1 << 29),
+ 	};
+ 
+ 	enum {
+@@ -355,7 +358,7 @@ public:
+ 	void _bind_canvas_texture(RID p_texture, RSE::CanvasItemTextureFilter p_base_filter, RSE::CanvasItemTextureRepeat p_base_repeat);
+ 	void _prepare_canvas_texture(RID p_texture, RSE::CanvasItemTextureFilter p_base_filter, RSE::CanvasItemTextureRepeat p_base_repeat, uint32_t &r_index, Size2 &r_texpixel_size);
+ 
+-	void canvas_render_items(RID p_to_render_target, Item *p_item_list, const Color &p_modulate, Light *p_light_list, Light *p_directional_list, const Transform2D &p_canvas_transform, RSE::CanvasItemTextureFilter p_default_filter, RSE::CanvasItemTextureRepeat p_default_repeat, bool p_snap_2d_vertices_to_pixel, bool &r_sdf_used, RenderingServerTypes::RenderInfo *r_render_info = nullptr) override;
++	void canvas_render_items(RID p_to_render_target, Item *p_item_list, const Color &p_modulate, Light *p_light_list, Light *p_directional_list, const Transform2D &p_canvas_transform, RSE::CanvasItemTextureFilter p_default_filter, RSE::CanvasItemTextureRepeat p_default_repeat, bool p_snap_2d_transforms_to_pixel, bool p_snap_2d_vertices_to_pixel, uint8_t p_snap_2d_transforms_method, bool &r_sdf_used, RenderingServerTypes::RenderInfo *r_render_info = nullptr) override;
+ 	void _render_items(RID p_to_render_target, int p_item_count, const Transform2D &p_canvas_transform_inverse, Light *p_lights, bool &r_sdf_used, bool p_to_backbuffer = false, RenderingServerTypes::RenderInfo *r_render_info = nullptr, bool p_backbuffer_has_mipmaps = false);
+ 	void _record_item_commands(const Item *p_item, RID p_render_target, const Transform2D &p_canvas_transform_inverse, Item *&current_clip, GLES3::CanvasShaderData::BlendMode p_blend_mode, Light *p_lights, uint32_t &r_index, bool &r_break_batch, bool &r_sdf_used, const Point2 &p_repeat_offset);
+ 	void _render_batch(Light *p_lights, uint32_t p_index, RenderingServerTypes::RenderInfo *r_render_info = nullptr);
+diff --git a/drivers/gles3/shaders/canvas.glsl b/drivers/gles3/shaders/canvas.glsl
+index 37d851a3c00336b254b17d3c41b9e84539ce5ef4..535593d7d3508a3f624d58cdd5dcbe9de6dd8693 100644
+--- a/drivers/gles3/shaders/canvas.glsl
++++ b/drivers/gles3/shaders/canvas.glsl
+@@ -267,6 +267,20 @@ void main() {
+ 
+ 	vertex = (canvas_transform * vec4(vertex, 0.0, 1.0)).xy;
+ 
++	if ((pad1 & 1u) != 0u && (read_draw_data_flags & INSTANCE_FLAGS_SKIP_SCREEN_TRANSFORM_SNAP) == uint(0)) {
++		vec2 transform_origin = (canvas_transform * model_matrix * vec4(0.0, 0.0, 0.0, 1.0)).xy;
++		vec2 snapped_origin = transform_origin;
++		if ((read_draw_data_flags & INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_X) != uint(0)) {
++			snapped_origin.x = floor(transform_origin.x + 0.5);
++		}
++		if ((read_draw_data_flags & INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_Y) != uint(0)) {
++			snapped_origin.y = floor(transform_origin.y + 0.5);
++		}
++		vertex += snapped_origin - transform_origin;
++		// Precision issue on some hardware creates artifacts within texture.
++		uv += 1e-5;
++	}
++
+ 	if (use_pixel_snap) {
+ 		vertex = floor(vertex + 0.5);
+ 		// precision issue on some hardware creates artifacts within texture
+diff --git a/drivers/gles3/shaders/canvas_uniforms_inc.glsl b/drivers/gles3/shaders/canvas_uniforms_inc.glsl
+index 94cbbdd8a7f553b72bbabbefb653ecce505099e3..1b564b8ddf1db0ccb4b1f411d3534ce6a60f2489 100644
+--- a/drivers/gles3/shaders/canvas_uniforms_inc.glsl
++++ b/drivers/gles3/shaders/canvas_uniforms_inc.glsl
+@@ -17,6 +17,9 @@
+ 
+ #define INSTANCE_FLAGS_SHADOW_MASKED_SHIFT 13u // 16 bits.
+ #define INSTANCE_FLAGS_SHADOW_MASKED uint(1 << INSTANCE_FLAGS_SHADOW_MASKED_SHIFT)
++#define INSTANCE_FLAGS_SKIP_SCREEN_TRANSFORM_SNAP uint(1u << 29u)
++#define INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_X uint(1u << 30u)
++#define INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_Y uint(1u << 31u)
+ 
+ // 1 means enabled, 2+ means trails in use
+ #define BATCH_FLAGS_INSTANCING_MASK uint(0x7F)
+diff --git a/editor/editor_node.cpp b/editor/editor_node.cpp
+index 5bc4649f867e8d0e04f53a1b8dfcc622441d6100..e5760723ed8e5ab733323fa4e64d7fa6d34cade7 100644
+--- a/editor/editor_node.cpp
++++ b/editor/editor_node.cpp
+@@ -537,6 +537,8 @@ void EditorNode::_update_from_settings() {
+ 
+ 	bool snap_2d_transforms = GLOBAL_GET("rendering/2d/snap/snap_2d_transforms_to_pixel");
+ 	scene_root->set_snap_2d_transforms_to_pixel(snap_2d_transforms);
++	int snap_2d_transforms_method = GLOBAL_GET("rendering/2d/snap/snap_2d_transforms_method");
++	scene_root->set_snap_2d_transforms_method(Viewport::Snap2DTransformsMethod(snap_2d_transforms_method));
+ 	bool snap_2d_vertices = GLOBAL_GET("rendering/2d/snap/snap_2d_vertices_to_pixel");
+ 	scene_root->set_snap_2d_vertices_to_pixel(snap_2d_vertices);
+ 
+diff --git a/scene/2d/cpu_particles_2d.cpp b/scene/2d/cpu_particles_2d.cpp
+index ac8d910a57464e507df9c46e0bc2a0c8a75bdb1c..d8bc69a8f50604a28b341ba140f4ae11dcf1d671 100644
+--- a/scene/2d/cpu_particles_2d.cpp
++++ b/scene/2d/cpu_particles_2d.cpp
+@@ -37,6 +37,7 @@
+ #include "core/object/callable_mp.h"
+ #include "core/object/class_db.h"
+ #include "scene/2d/gpu_particles_2d.h"
++#include "scene/main/viewport.h"
+ #include "scene/main/scene_tree.h"
+ #include "scene/resources/atlas_texture.h"
+ #include "scene/resources/canvas_item_material.h"
+@@ -191,11 +192,16 @@ void CPUParticles2D::_update_mesh_texture() {
+ 		tex_size = Size2(1, 1);
+ 	}
+ 
++	Point2 dest_offset = -tex_size * 0.5;
++	if (is_inside_tree() && get_viewport() && get_viewport()->is_snap_2d_transforms_to_pixel_screen_enabled() && !is_snap_2d_transforms_canvas_space_in_tree()) {
++		dest_offset = (dest_offset + Point2(0.5, 0.5)).floor();
++	}
++
+ 	Vector<Vector2> vertices = {
+-		-tex_size * 0.5,
+-		-tex_size * 0.5 + Vector2(tex_size.x, 0),
+-		-tex_size * 0.5 + tex_size,
+-		-tex_size * 0.5 + Vector2(0, tex_size.y)
++		dest_offset,
++		dest_offset + Vector2(tex_size.x, 0),
++		dest_offset + tex_size,
++		dest_offset + Vector2(0, tex_size.y)
+ 	};
+ 
+ 	Vector<Vector2> uvs;
+@@ -1300,6 +1306,8 @@ void CPUParticles2D::_notification(int p_what) {
+ 		case NOTIFICATION_ENTER_TREE: {
+ 			set_process_internal(emitting);
+ 
++			_update_mesh_texture();
++
+ 			_refresh_interpolation_state();
+ 
+ 			// If we are interpolated following, then reset physics interpolation
+diff --git a/scene/2d/gpu_particles_2d.cpp b/scene/2d/gpu_particles_2d.cpp
+index 7c908036f9bd8f6506f81b9501448ececea31c18..a161bb3106e1e14e005ca0bede42e5100173ea73 100644
+--- a/scene/2d/gpu_particles_2d.cpp
++++ b/scene/2d/gpu_particles_2d.cpp
+@@ -36,6 +36,7 @@
+ #include "core/object/class_db.h"
+ #include "core/os/os.h"
+ #include "scene/2d/cpu_particles_2d.h"
++#include "scene/main/viewport.h"
+ #include "scene/resources/atlas_texture.h"
+ #include "scene/resources/canvas_item_material.h"
+ #include "scene/resources/curve_texture.h"
+@@ -704,11 +705,16 @@ void GPUParticles2D::_notification(int p_what) {
+ 			} else {
+ 				RS::get_singleton()->mesh_clear(mesh);
+ 
++				Point2 dest_offset = -size * 0.5;
++				if (get_viewport() && get_viewport()->is_snap_2d_transforms_to_pixel_screen_enabled() && !is_snap_2d_transforms_canvas_space_in_tree()) {
++					dest_offset = (dest_offset + Point2(0.5, 0.5)).floor();
++				}
++
+ 				Vector<Vector2> points = {
+-					Vector2(-size.x / 2.0, -size.y / 2.0),
+-					Vector2(size.x / 2.0, -size.y / 2.0),
+-					Vector2(size.x / 2.0, size.y / 2.0),
+-					Vector2(-size.x / 2.0, size.y / 2.0)
++					dest_offset,
++					dest_offset + Vector2(size.x, 0),
++					dest_offset + size,
++					dest_offset + Vector2(0, size.y)
+ 				};
+ 
+ 				Vector<Vector2> uvs;
+diff --git a/scene/2d/parallax_2d.cpp b/scene/2d/parallax_2d.cpp
+index 35e05e2fdd25da10bf8015c29a31930bfe74f2f3..89de18a7fe60a2dcbabc9d6912c15118ff21002c 100644
+--- a/scene/2d/parallax_2d.cpp
++++ b/scene/2d/parallax_2d.cpp
+@@ -86,7 +86,7 @@ void Parallax2D::_validate_property(PropertyInfo &p_property) const {
+ 
+ void Parallax2D::_camera_moved(const Transform2D &p_transform, const Point2 &p_screen_offset, const Point2 &p_adj_screen_pos) {
+ 	if (!ignore_camera_scroll) {
+-		if (get_viewport() && get_viewport()->is_snap_2d_transforms_to_pixel_enabled()) {
++		if (get_viewport() && get_viewport()->is_snap_2d_transforms_to_pixel_canvas_enabled()) {
+ 			Size2 vps = get_viewport_rect().size;
+ 			Vector2 offset;
+ 			offset.x = ((int)vps.width % 2) ? 0.0 : 0.5;
+diff --git a/scene/main/canvas_item.cpp b/scene/main/canvas_item.cpp
+index d731e2e0993bc8512a12ad0aa68bf73e933b51be..c7d8fcd2c59a51420bc6946481afa43d6a0dfb4f 100644
+--- a/scene/main/canvas_item.cpp
++++ b/scene/main/canvas_item.cpp
+@@ -305,6 +305,8 @@ void CanvasItem::_enter_canvas() {
+ 
+ 	queue_redraw();
+ 
++	_update_snap_2d_transforms_mode_changed(false);
++
+ 	notification(NOTIFICATION_ENTER_CANVAS);
+ }
+ 
+@@ -1569,6 +1571,10 @@ void CanvasItem::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("set_texture_repeat", "mode"), &CanvasItem::set_texture_repeat);
+ 	ClassDB::bind_method(D_METHOD("get_texture_repeat"), &CanvasItem::get_texture_repeat);
+ 
++	ClassDB::bind_method(D_METHOD("set_snap_2d_transforms_mode", "mode"), &CanvasItem::set_snap_2d_transforms_mode);
++	ClassDB::bind_method(D_METHOD("get_snap_2d_transforms_mode"), &CanvasItem::get_snap_2d_transforms_mode);
++	ClassDB::bind_method(D_METHOD("is_snap_2d_transforms_canvas_space_in_tree"), &CanvasItem::is_snap_2d_transforms_canvas_space_in_tree);
++
+ 	ClassDB::bind_method(D_METHOD("set_clip_children_mode", "mode"), &CanvasItem::set_clip_children_mode);
+ 	ClassDB::bind_method(D_METHOD("get_clip_children_mode"), &CanvasItem::get_clip_children_mode);
+ 
+@@ -1597,6 +1603,10 @@ void CanvasItem::_bind_methods() {
+ 	ADD_PROPERTY(PropertyInfo(Variant::INT, "texture_filter", PROPERTY_HINT_ENUM, "Inherit,Nearest,Linear,Nearest Mipmap,Linear Mipmap,Nearest Mipmap Anisotropic,Linear Mipmap Anisotropic"), "set_texture_filter", "get_texture_filter");
+ 	ADD_PROPERTY(PropertyInfo(Variant::INT, "texture_repeat", PROPERTY_HINT_ENUM, "Inherit,Disabled,Enabled,Mirror"), "set_texture_repeat", "get_texture_repeat");
+ 
++	ADD_GROUP("Transform Snap", "snap_2d_transforms_");
++	ADD_PROPERTY(PropertyInfo(Variant::INT, "snap_2d_transforms_mode", PROPERTY_HINT_ENUM, "Inherit,Canvas Space,Screen Space"), "set_snap_2d_transforms_mode", "get_snap_2d_transforms_mode");
++	ADD_PROPERTY_DEFAULT("snap_2d_transforms_mode", Snap2DTransformsMode::SNAP_2D_TRANSFORMS_MODE_INHERIT);
++
+ 	ADD_GROUP("Material", "");
+ 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "material", PROPERTY_HINT_RESOURCE_TYPE, "CanvasItemMaterial,ShaderMaterial"), "set_material", "get_material");
+ 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "use_parent_material"), "set_use_parent_material", "get_use_parent_material");
+@@ -1642,6 +1652,11 @@ void CanvasItem::_bind_methods() {
+ 	BIND_ENUM_CONSTANT(OVERSAMPLING_WITH_SCALE_DISABLED);
+ 	BIND_ENUM_CONSTANT(OVERSAMPLING_WITH_SCALE_ENABLED);
+ 	BIND_ENUM_CONSTANT(OVERSAMPLING_WITH_SCALE_MAX);
++
++	BIND_ENUM_CONSTANT(SNAP_2D_TRANSFORMS_MODE_INHERIT);
++	BIND_ENUM_CONSTANT(SNAP_2D_TRANSFORMS_MODE_CANVAS);
++	BIND_ENUM_CONSTANT(SNAP_2D_TRANSFORMS_MODE_SCREEN);
++	BIND_ENUM_CONSTANT(SNAP_2D_TRANSFORMS_MODE_MAX);
+ }
+ 
+ Transform2D CanvasItem::get_canvas_transform() const {
+@@ -1755,6 +1770,46 @@ void CanvasItem::_refresh_texture_filter_cache() const {
+ 	}
+ }
+ 
++void CanvasItem::_update_snap_2d_transforms_mode_changed(bool p_propagate) {
++	RS::get_singleton()->canvas_item_set_snap_2d_transforms_mode(get_canvas_item(), snap_2d_transforms_mode);
++
++	if (p_propagate) {
++		for (CanvasItem *child_ci : data.canvas_item_children) {
++			if (child_ci->snap_2d_transforms_mode == SNAP_2D_TRANSFORMS_MODE_INHERIT) {
++				child_ci->_update_snap_2d_transforms_mode_changed(true);
++			}
++		}
++	}
++}
++
++void CanvasItem::set_snap_2d_transforms_mode(Snap2DTransformsMode p_mode) {
++	ERR_FAIL_INDEX(p_mode, SNAP_2D_TRANSFORMS_MODE_MAX);
++	if (snap_2d_transforms_mode == p_mode) {
++		return;
++	}
++	snap_2d_transforms_mode = p_mode;
++	_update_snap_2d_transforms_mode_changed(true);
++	queue_redraw();
++}
++
++CanvasItem::Snap2DTransformsMode CanvasItem::get_snap_2d_transforms_mode() const {
++	return snap_2d_transforms_mode;
++}
++
++bool CanvasItem::is_snap_2d_transforms_canvas_space_in_tree() const {
++	Viewport *viewport = get_viewport();
++	if (!viewport || !viewport->is_snap_2d_transforms_to_pixel_enabled()) {
++		return false;
++	}
++	if (snap_2d_transforms_mode == SNAP_2D_TRANSFORMS_MODE_CANVAS) {
++		return true;
++	}
++	if (CanvasItem *parent_item = get_parent_item()) {
++		return parent_item->is_snap_2d_transforms_canvas_space_in_tree();
++	}
++	return viewport->is_snap_2d_transforms_to_pixel_canvas_enabled();
++}
++
+ void CanvasItem::_update_self_texture_filter(RSE::CanvasItemTextureFilter p_texture_filter) {
+ 	RS::get_singleton()->canvas_item_set_default_texture_filter(get_canvas_item(), p_texture_filter);
+ 	queue_redraw();
+diff --git a/scene/main/canvas_item.h b/scene/main/canvas_item.h
+index c5dc1425e3dc851ca16a456f7fe1a01eb23b9b0c..1c3924afb0f9c10fbfdd390962f7ee26b9e2b3c8 100644
+--- a/scene/main/canvas_item.h
++++ b/scene/main/canvas_item.h
+@@ -85,6 +85,13 @@ public:
+ 		OVERSAMPLING_WITH_SCALE_MAX,
+ 	};
+ 
++	enum Snap2DTransformsMode {
++		SNAP_2D_TRANSFORMS_MODE_INHERIT,
++		SNAP_2D_TRANSFORMS_MODE_CANVAS,
++		SNAP_2D_TRANSFORMS_MODE_SCREEN,
++		SNAP_2D_TRANSFORMS_MODE_MAX,
++	};
++
+ private:
+ 	mutable SelfList<Node> xform_change;
+ 
+@@ -143,6 +150,7 @@ private:
+ 	mutable RSE::CanvasItemTextureRepeat texture_repeat_cache = RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED;
+ 	TextureFilter texture_filter = TEXTURE_FILTER_PARENT_NODE;
+ 	TextureRepeat texture_repeat = TEXTURE_REPEAT_PARENT_NODE;
++	Snap2DTransformsMode snap_2d_transforms_mode = SNAP_2D_TRANSFORMS_MODE_INHERIT;
+ 
+ 	Ref<Material> material;
+ 	mutable HashMap<StringName, Variant> instance_shader_parameters;
+@@ -177,6 +185,7 @@ private:
+ 	void _update_texture_repeat_changed(bool p_propagate);
+ 	void _refresh_texture_filter_cache() const;
+ 	void _update_texture_filter_changed(bool p_propagate);
++	void _update_snap_2d_transforms_mode_changed(bool p_propagate);
+ 
+ 	void _notify_transform_deferred();
+ 	const StringName *_instance_shader_parameter_get_remap(const StringName &p_name) const;
+@@ -435,6 +444,10 @@ public:
+ 	TextureFilter get_texture_filter_in_tree() const;
+ 	TextureRepeat get_texture_repeat_in_tree() const;
+ 
++	void set_snap_2d_transforms_mode(Snap2DTransformsMode p_mode);
++	Snap2DTransformsMode get_snap_2d_transforms_mode() const;
++	bool is_snap_2d_transforms_canvas_space_in_tree() const;
++
+ 	OversamplingWithScale get_oversampling_with_scale() const;
+ 	void set_oversampling_with_scale(OversamplingWithScale p_mode);
+ 
+@@ -454,6 +467,7 @@ VARIANT_ENUM_CAST(CanvasItem::TextureFilter)
+ VARIANT_ENUM_CAST(CanvasItem::TextureRepeat)
+ VARIANT_ENUM_CAST(CanvasItem::ClipChildrenMode)
+ VARIANT_ENUM_CAST(CanvasItem::OversamplingWithScale)
++VARIANT_ENUM_CAST(CanvasItem::Snap2DTransformsMode)
+ 
+ class CanvasTexture : public Texture2D {
+ 	GDCLASS(CanvasTexture, Texture2D);
+diff --git a/scene/main/scene_tree.cpp b/scene/main/scene_tree.cpp
+index dd92f0f498c9345acdf0d19ce2f57ac9cc217d29..8b25601c5286b098145e44caf173f859b9ebe60e 100644
+--- a/scene/main/scene_tree.cpp
++++ b/scene/main/scene_tree.cpp
+@@ -2140,6 +2140,9 @@ SceneTree::SceneTree() {
+ 	bool snap_2d_transforms = GLOBAL_DEF_BASIC("rendering/2d/snap/snap_2d_transforms_to_pixel", false);
+ 	root->set_snap_2d_transforms_to_pixel(snap_2d_transforms);
+ 
++	int snap_2d_transforms_method = GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/2d/snap/snap_2d_transforms_method", PROPERTY_HINT_ENUM, "Canvas Space (Default),Screen Space,Screen Space When Moving"), 0);
++	root->set_snap_2d_transforms_method(Viewport::Snap2DTransformsMethod(snap_2d_transforms_method));
++
+ 	bool snap_2d_vertices = GLOBAL_DEF("rendering/2d/snap/snap_2d_vertices_to_pixel", false);
+ 	root->set_snap_2d_vertices_to_pixel(snap_2d_vertices);
+ 
+diff --git a/scene/main/viewport.cpp b/scene/main/viewport.cpp
+index 54f9f2c4461ebc293dec9bccdbab3031c1c03f32..20aabeb65af1e18dd81402b3bd8f8289d164a6bf 100644
+--- a/scene/main/viewport.cpp
++++ b/scene/main/viewport.cpp
+@@ -3940,6 +3940,27 @@ bool Viewport::is_snap_2d_transforms_to_pixel_enabled() const {
+ 	return snap_2d_transforms_to_pixel;
+ }
+ 
++void Viewport::set_snap_2d_transforms_method(Snap2DTransformsMethod p_method) {
++	ERR_MAIN_THREAD_GUARD;
++	snap_2d_transforms_method = p_method;
++	RS::get_singleton()->viewport_set_snap_2d_transforms_method(viewport, p_method);
++}
++
++Viewport::Snap2DTransformsMethod Viewport::get_snap_2d_transforms_method() const {
++	ERR_READ_THREAD_GUARD_V(SNAP_2D_TRANSFORMS_METHOD_CANVAS);
++	return snap_2d_transforms_method;
++}
++
++bool Viewport::is_snap_2d_transforms_to_pixel_canvas_enabled() const {
++	ERR_READ_THREAD_GUARD_V(false);
++	return snap_2d_transforms_to_pixel && snap_2d_transforms_method == SNAP_2D_TRANSFORMS_METHOD_CANVAS;
++}
++
++bool Viewport::is_snap_2d_transforms_to_pixel_screen_enabled() const {
++	ERR_READ_THREAD_GUARD_V(false);
++	return snap_2d_transforms_to_pixel && (snap_2d_transforms_method == SNAP_2D_TRANSFORMS_METHOD_SCREEN || snap_2d_transforms_method == SNAP_2D_TRANSFORMS_METHOD_SCREEN_MOVING);
++}
++
+ void Viewport::set_snap_2d_vertices_to_pixel(bool p_enable) {
+ 	ERR_MAIN_THREAD_GUARD;
+ 	snap_2d_vertices_to_pixel = p_enable;
+@@ -5249,6 +5270,8 @@ void Viewport::_bind_methods() {
+ 
+ 	ClassDB::bind_method(D_METHOD("set_snap_2d_transforms_to_pixel", "enabled"), &Viewport::set_snap_2d_transforms_to_pixel);
+ 	ClassDB::bind_method(D_METHOD("is_snap_2d_transforms_to_pixel_enabled"), &Viewport::is_snap_2d_transforms_to_pixel_enabled);
++	ClassDB::bind_method(D_METHOD("set_snap_2d_transforms_method", "method"), &Viewport::set_snap_2d_transforms_method);
++	ClassDB::bind_method(D_METHOD("get_snap_2d_transforms_method"), &Viewport::get_snap_2d_transforms_method);
+ 
+ 	ClassDB::bind_method(D_METHOD("set_snap_2d_vertices_to_pixel", "enabled"), &Viewport::set_snap_2d_vertices_to_pixel);
+ 	ClassDB::bind_method(D_METHOD("is_snap_2d_vertices_to_pixel_enabled"), &Viewport::is_snap_2d_vertices_to_pixel_enabled);
+@@ -5355,6 +5378,7 @@ void Viewport::_bind_methods() {
+ 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "transparent_bg"), "set_transparent_background", "has_transparent_background");
+ 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "handle_input_locally"), "set_handle_input_locally", "is_handling_input_locally");
+ 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "snap_2d_transforms_to_pixel"), "set_snap_2d_transforms_to_pixel", "is_snap_2d_transforms_to_pixel_enabled");
++	ADD_PROPERTY(PropertyInfo(Variant::INT, "snap_2d_transforms_method", PROPERTY_HINT_ENUM, "Canvas Space (Default),Screen Space,Screen Space When Moving"), "set_snap_2d_transforms_method", "get_snap_2d_transforms_method");
+ 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "snap_2d_vertices_to_pixel"), "set_snap_2d_vertices_to_pixel", "is_snap_2d_vertices_to_pixel_enabled");
+ 	ADD_GROUP("Rendering", "");
+ 	ADD_PROPERTY(PropertyInfo(Variant::INT, "msaa_2d", PROPERTY_HINT_ENUM, String::utf8("Disabled (Fastest),2× (Average),4× (Slow),8× (Slowest)")), "set_msaa_2d", "get_msaa_2d");
+@@ -5453,6 +5477,10 @@ void Viewport::_bind_methods() {
+ 	BIND_ENUM_CONSTANT(SCREEN_SPACE_AA_SMAA);
+ 	BIND_ENUM_CONSTANT(SCREEN_SPACE_AA_MAX);
+ 
++	BIND_ENUM_CONSTANT(SNAP_2D_TRANSFORMS_METHOD_CANVAS);
++	BIND_ENUM_CONSTANT(SNAP_2D_TRANSFORMS_METHOD_SCREEN);
++	BIND_ENUM_CONSTANT(SNAP_2D_TRANSFORMS_METHOD_SCREEN_MOVING);
++
+ 	BIND_ENUM_CONSTANT(RENDER_INFO_OBJECTS_IN_FRAME);
+ 	BIND_ENUM_CONSTANT(RENDER_INFO_PRIMITIVES_IN_FRAME);
+ 	BIND_ENUM_CONSTANT(RENDER_INFO_DRAW_CALLS_IN_FRAME);
+diff --git a/scene/main/viewport.h b/scene/main/viewport.h
+index 4e1c272d71a6698cfb2ecd421181fc251ed222e3..73609dd17aa4ba30a9a1fd096c148e7746d05c0c 100644
+--- a/scene/main/viewport.h
++++ b/scene/main/viewport.h
+@@ -143,6 +143,12 @@ public:
+ 		SCREEN_SPACE_AA_MAX
+ 	};
+ 
++	enum Snap2DTransformsMethod {
++		SNAP_2D_TRANSFORMS_METHOD_CANVAS = 0,
++		SNAP_2D_TRANSFORMS_METHOD_SCREEN = 1,
++		SNAP_2D_TRANSFORMS_METHOD_SCREEN_MOVING = 2,
++	};
++
+ 	enum RenderInfo {
+ 		RENDER_INFO_OBJECTS_IN_FRAME,
+ 		RENDER_INFO_PRIMITIVES_IN_FRAME,
+@@ -274,6 +280,7 @@ private:
+ 	bool snap_controls_to_pixels = true;
+ 	bool snap_2d_transforms_to_pixel = false;
+ 	bool snap_2d_vertices_to_pixel = false;
++	Snap2DTransformsMethod snap_2d_transforms_method = SNAP_2D_TRANSFORMS_METHOD_CANVAS;
+ 
+ #if !defined(PHYSICS_2D_DISABLED) || !defined(PHYSICS_3D_DISABLED)
+ 	bool physics_object_picking = false;
+@@ -680,6 +687,10 @@ public:
+ 
+ 	void set_snap_2d_transforms_to_pixel(bool p_enable);
+ 	bool is_snap_2d_transforms_to_pixel_enabled() const;
++	void set_snap_2d_transforms_method(Snap2DTransformsMethod p_method);
++	Snap2DTransformsMethod get_snap_2d_transforms_method() const;
++	bool is_snap_2d_transforms_to_pixel_canvas_enabled() const;
++	bool is_snap_2d_transforms_to_pixel_screen_enabled() const;
+ 
+ 	void set_snap_2d_vertices_to_pixel(bool p_enable);
+ 	bool is_snap_2d_vertices_to_pixel_enabled() const;
+@@ -962,6 +973,7 @@ VARIANT_ENUM_CAST(Viewport::PositionalShadowAtlasQuadrantSubdiv);
+ VARIANT_ENUM_CAST(Viewport::MSAA);
+ VARIANT_ENUM_CAST(Viewport::AnisotropicFiltering);
+ VARIANT_ENUM_CAST(Viewport::ScreenSpaceAA);
++VARIANT_ENUM_CAST(Viewport::Snap2DTransformsMethod);
+ VARIANT_ENUM_CAST(Viewport::DebugDraw);
+ VARIANT_ENUM_CAST(Viewport::SDFScale);
+ VARIANT_ENUM_CAST(Viewport::SDFOversize);
+diff --git a/servers/rendering/dummy/rasterizer_canvas_dummy.h b/servers/rendering/dummy/rasterizer_canvas_dummy.h
+index 98cf58c2537459f9dd8198bb5e543e2b45a01ec2..a5d851a547f8b2a2a9ff88420f4d26dd4bbac2ab 100644
+--- a/servers/rendering/dummy/rasterizer_canvas_dummy.h
++++ b/servers/rendering/dummy/rasterizer_canvas_dummy.h
+@@ -37,7 +37,7 @@ public:
+ 	PolygonID request_polygon(const Vector<int> &p_indices, const Vector<Point2> &p_points, const Vector<Color> &p_colors, const Vector<Point2> &p_uvs = Vector<Point2>(), const Vector<int> &p_bones = Vector<int>(), const Vector<float> &p_weights = Vector<float>(), int p_count = -1) override { return 0; }
+ 	void free_polygon(PolygonID p_polygon) override {}
+ 
+-	void canvas_render_items(RID p_to_render_target, Item *p_item_list, const Color &p_modulate, Light *p_light_list, Light *p_directional_list, const Transform2D &p_canvas_transform, RSE::CanvasItemTextureFilter p_default_filter, RSE::CanvasItemTextureRepeat p_default_repeat, bool p_snap_2d_vertices_to_pixel, bool &r_sdf_used, RenderingServerTypes::RenderInfo *r_render_info = nullptr) override {}
++	void canvas_render_items(RID p_to_render_target, Item *p_item_list, const Color &p_modulate, Light *p_light_list, Light *p_directional_list, const Transform2D &p_canvas_transform, RSE::CanvasItemTextureFilter p_default_filter, RSE::CanvasItemTextureRepeat p_default_repeat, bool p_snap_2d_transforms_to_pixel, bool p_snap_2d_vertices_to_pixel, uint8_t p_snap_2d_transforms_method, bool &r_sdf_used, RenderingServerTypes::RenderInfo *r_render_info = nullptr) override {}
+ 
+ 	RID light_create() override { return RID(); }
+ 	void light_set_texture(RID p_rid, RID p_texture) override {}
+diff --git a/servers/rendering/renderer_canvas_cull.cpp b/servers/rendering/renderer_canvas_cull.cpp
+index 9a0c442d8fc9ec500ade6520c758ec39315eda2f..ff9f6beae637f4cb5fe2ef75e1c554b73f0e0e7d 100644
+--- a/servers/rendering/renderer_canvas_cull.cpp
++++ b/servers/rendering/renderer_canvas_cull.cpp
+@@ -30,6 +30,8 @@
+ 
+ #include "renderer_canvas_cull.h"
+ 
++#include "renderer_snap_2d.h"
++
+ #include "core/config/engine.h"
+ #include "core/config/project_settings.h"
+ #include "core/math/geometry_2d.h"
+@@ -68,7 +70,7 @@ void RendererCanvasCull::_dependency_deleted(const RID &p_dependency, Dependency
+ 	_canvas_cull_singleton->_item_queue_update(item, true);
+ }
+ 
+-void RendererCanvasCull::_render_canvas_item_tree(RID p_to_render_target, Canvas::ChildItem *p_child_items, int p_child_item_count, const Transform2D &p_transform, const Rect2 &p_clip_rect, const Color &p_modulate, RendererCanvasRender::Light *p_lights, RendererCanvasRender::Light *p_directional_lights, RSE::CanvasItemTextureFilter p_default_filter, RSE::CanvasItemTextureRepeat p_default_repeat, bool p_snap_2d_vertices_to_pixel, uint32_t p_canvas_cull_mask, RenderingServerTypes::RenderInfo *r_render_info) {
++void RendererCanvasCull::_render_canvas_item_tree(RID p_to_render_target, Canvas::ChildItem *p_child_items, int p_child_item_count, const Transform2D &p_transform, const Rect2 &p_clip_rect, const Color &p_modulate, RendererCanvasRender::Light *p_lights, RendererCanvasRender::Light *p_directional_lights, RSE::CanvasItemTextureFilter p_default_filter, RSE::CanvasItemTextureRepeat p_default_repeat, bool p_snap_2d_transforms_to_pixel, bool p_snap_2d_vertices_to_pixel, uint8_t p_snap_2d_transforms_method, uint32_t p_canvas_cull_mask, RenderingServerTypes::RenderInfo *r_render_info) {
+ 	RENDER_TIMESTAMP("Cull CanvasItem Tree");
+ 
+ 	// This is used to avoid passing the camera transform down the rendering
+@@ -80,7 +82,7 @@ void RendererCanvasCull::_render_canvas_item_tree(RID p_to_render_target, Canvas
+ 	memset(z_last_list, 0, z_range * sizeof(RendererCanvasRender::Item *));
+ 
+ 	for (int i = 0; i < p_child_item_count; i++) {
+-		_cull_canvas_item(p_child_items[i].item, p_transform, p_clip_rect, Color(1, 1, 1, 1), 0, z_list, z_last_list, nullptr, nullptr, false, p_canvas_cull_mask, Point2(), 1, nullptr);
++		_cull_canvas_item(p_child_items[i].item, p_transform, p_transform, p_clip_rect, Color(1, 1, 1, 1), 0, z_list, z_last_list, nullptr, nullptr, false, p_canvas_cull_mask, _viewport_uses_canvas_transform_snap, false, false, false, Point2(), 1, nullptr);
+ 	}
+ 
+ 	RendererCanvasRender::Item *list = nullptr;
+@@ -102,13 +104,13 @@ void RendererCanvasCull::_render_canvas_item_tree(RID p_to_render_target, Canvas
+ 	RENDER_TIMESTAMP("Render CanvasItems");
+ 
+ 	bool sdf_flag;
+-	RSG::canvas_render->canvas_render_items(p_to_render_target, list, p_modulate, p_lights, p_directional_lights, p_transform, p_default_filter, p_default_repeat, p_snap_2d_vertices_to_pixel, sdf_flag, r_render_info);
++	RSG::canvas_render->canvas_render_items(p_to_render_target, list, p_modulate, p_lights, p_directional_lights, p_transform, p_default_filter, p_default_repeat, p_snap_2d_transforms_to_pixel, p_snap_2d_vertices_to_pixel, p_snap_2d_transforms_method, sdf_flag, r_render_info);
+ 	if (sdf_flag) {
+ 		sdf_used = true;
+ 	}
+ }
+ 
+-void RendererCanvasCull::_collect_ysort_children(RendererCanvasCull::Item *p_canvas_item, RendererCanvasCull::Item *p_material_owner, const Color &p_modulate, RendererCanvasCull::Item **r_items, int &r_index, int &r_ysort_children_count, int p_z, uint32_t p_canvas_cull_mask) {
++void RendererCanvasCull::_collect_ysort_children(RendererCanvasCull::Item *p_canvas_item, RendererCanvasCull::Item *p_material_owner, const Color &p_modulate, RendererCanvasCull::Item **r_items, int &r_index, int &r_ysort_children_count, int p_z, uint32_t p_canvas_cull_mask, bool p_parent_uses_canvas_transform_snap) {
+ 	int child_item_count = p_canvas_item->child_items.size();
+ 	RendererCanvasCull::Item **child_items = p_canvas_item->child_items.ptrw();
+ 	for (int i = 0; i < child_item_count; i++) {
+@@ -124,7 +126,7 @@ void RendererCanvasCull::_collect_ysort_children(RendererCanvasCull::Item *p_can
+ 					TransformInterpolator::interpolate_transform_2d(child_items[i]->xform_prev, child_items[i]->xform_curr, child_xform, f);
+ 				}
+ 
+-				if (snapping_2d_transforms_to_pixel) {
++				if (_item_uses_canvas_transform_snap(child_items[i], p_parent_uses_canvas_transform_snap)) {
+ 					child_xform.columns[2] = (child_xform.columns[2] + Point2(0.5, 0.5)).floor();
+ 				}
+ 
+@@ -152,7 +154,7 @@ void RendererCanvasCull::_collect_ysort_children(RendererCanvasCull::Item *p_can
+ 				r_index++;
+ 
+ 				if (child_items[i]->sort_y) {
+-					_collect_ysort_children(child_items[i], child_items[i]->use_parent_material ? p_material_owner : child_items[i], p_modulate * child_items[i]->modulate, r_items, r_index, r_ysort_children_count, abs_z, p_canvas_cull_mask);
++					_collect_ysort_children(child_items[i], child_items[i]->use_parent_material ? p_material_owner : child_items[i], p_modulate * child_items[i]->modulate, r_items, r_index, r_ysort_children_count, abs_z, p_canvas_cull_mask, _item_uses_canvas_transform_snap(child_items[i], p_parent_uses_canvas_transform_snap));
+ 				}
+ 			} else {
+ 				r_ysort_children_count--;
+@@ -189,6 +191,140 @@ void RendererCanvasCull::_mark_ysort_dirty(RendererCanvasCull::Item *ysort_owner
+ 	} while (ysort_owner && ysort_owner->sort_y);
+ }
+ 
++void RendererCanvasCull::_detect_screen_transform_snap_axes(Item *p_item, const Point2 &p_world_origin, bool &r_moving_x, bool &r_moving_y) {
++	if (p_item->screen_transform_snap_world_origin_valid) {
++		const real_t epsilon = RendererSnap2D::SCREEN_TRANSFORM_SNAP_MOVING_EPSILON;
++		const Point2 delta = p_world_origin - p_item->screen_transform_snap_world_origin_prev;
++		r_moving_x = Math::abs(delta.x) >= epsilon;
++		r_moving_y = Math::abs(delta.y) >= epsilon;
++
++		// Suppress GPU snap on a secondary axis when its delta is physics/float jitter
++		// (e.g. CharacterBody floor correction ~0.017 px) while the other axis moves.
++		if (r_moving_x && r_moving_y) {
++			const real_t abs_delta_x = Math::abs(delta.x);
++			const real_t abs_delta_y = Math::abs(delta.y);
++			const real_t jitter_epsilon = RendererSnap2D::SCREEN_TRANSFORM_SNAP_MOVING_JITTER_EPSILON;
++
++			if (abs_delta_y < jitter_epsilon) {
++				r_moving_y = false;
++			}
++			if (abs_delta_x < jitter_epsilon) {
++				r_moving_x = false;
++			}
++		}
++	} else {
++		r_moving_x = false;
++		r_moving_y = false;
++	}
++
++	p_item->screen_transform_snap_world_origin_prev = p_world_origin;
++	p_item->screen_transform_snap_world_origin_valid = true;
++}
++
++void RendererCanvasCull::_resolve_screen_transform_snap_axes(bool p_moving_x, bool p_moving_y, bool p_inherit_gpu_snap_x, bool p_inherit_gpu_snap_y, bool &r_gpu_snap_x, bool &r_gpu_snap_y) {
++	// Default to canvas snap. GPU only when a moving parent passes it down, or this item moves.
++	r_gpu_snap_x = p_inherit_gpu_snap_x || p_moving_x;
++	r_gpu_snap_y = p_inherit_gpu_snap_y || p_moving_y;
++}
++
++void RendererCanvasCull::_apply_axis_canvas_transform_snap(Transform2D &p_self_xform, Transform2D &p_parent_xform, bool p_canvas_snap_x, bool p_canvas_snap_y) {
++	if (!p_canvas_snap_x && !p_canvas_snap_y) {
++		return;
++	}
++
++	if (p_canvas_snap_x) {
++		p_self_xform.columns[2].x = Math::floor(p_self_xform.columns[2].x + 0.5);
++		p_parent_xform.columns[2].x = Math::floor(p_parent_xform.columns[2].x + 0.5);
++	}
++	if (p_canvas_snap_y) {
++		p_self_xform.columns[2].y = Math::floor(p_self_xform.columns[2].y + 0.5);
++		p_parent_xform.columns[2].y = Math::floor(p_parent_xform.columns[2].y + 0.5);
++	}
++}
++
++void RendererCanvasCull::_apply_render_origin_axis_canvas_snap(Transform2D &p_final_xform, bool p_canvas_snap_x, bool p_canvas_snap_y) {
++	if (!p_canvas_snap_x && !p_canvas_snap_y) {
++		return;
++	}
++
++	Point2 origin = p_final_xform.columns[2];
++	if (p_canvas_snap_x) {
++		origin.x = Math::floor(origin.x + 0.5);
++	}
++	if (p_canvas_snap_y) {
++		origin.y = Math::floor(origin.y + 0.5);
++	}
++	p_final_xform.columns[2] = origin;
++}
++
++void RendererCanvasCull::_apply_screen_transform_snap_moving(Item *p_item, const Transform2D &p_unsnapped_final_xform, bool p_inherit_gpu_snap_x, bool p_inherit_gpu_snap_y, bool &r_gpu_snap_x, bool &r_gpu_snap_y) {
++	const Point2 world_origin = _get_screen_transform_snap_world_origin(p_unsnapped_final_xform);
++
++	bool moving_x = false;
++	bool moving_y = false;
++	_detect_screen_transform_snap_axes(p_item, world_origin, moving_x, moving_y);
++	_resolve_screen_transform_snap_axes(moving_x, moving_y, p_inherit_gpu_snap_x, p_inherit_gpu_snap_y, r_gpu_snap_x, r_gpu_snap_y);
++
++	p_item->screen_transform_snap_x = r_gpu_snap_x;
++	p_item->screen_transform_snap_y = r_gpu_snap_y;
++}
++
++Point2 RendererCanvasCull::_get_screen_transform_snap_world_origin(const Transform2D &p_final_xform) const {
++	return _current_camera_transform.affine_inverse().xform(p_final_xform.get_origin());
++}
++
++void RendererCanvasCull::_apply_hybrid_canvas_transform_snap(Transform2D &p_self_xform, Transform2D &p_parent_xform, bool p_gpu_snap_x, bool p_gpu_snap_y) {
++	if (p_gpu_snap_x && p_gpu_snap_y) {
++		return;
++	}
++
++	if (!p_gpu_snap_x && !p_gpu_snap_y) {
++		// Fully static: match Canvas Space mode exactly.
++		p_self_xform.columns[2] = (p_self_xform.columns[2] + Point2(0.5, 0.5)).floor();
++		p_parent_xform.columns[2] = (p_parent_xform.columns[2] + Point2(0.5, 0.5)).floor();
++		return;
++	}
++
++	_apply_axis_canvas_transform_snap(p_self_xform, p_parent_xform, !p_gpu_snap_x, !p_gpu_snap_y);
++}
++
++Transform2D RendererCanvasCull::_build_screen_transform_snap_draw_xform(const Transform2D &p_final_xform, const Transform2D &p_unsnapped_final_xform, bool p_gpu_snap_x, bool p_gpu_snap_y) const {
++	if (p_gpu_snap_x && p_gpu_snap_y) {
++		return p_unsnapped_final_xform;
++	}
++	if (!p_gpu_snap_x && !p_gpu_snap_y) {
++		return p_final_xform;
++	}
++
++	// Mixed-axis GPU: hybrid final encodes per-level canvas snap on static axes, but composing
++	// through a canvas-snapped parent can quantize the moving axis before the GPU shader runs.
++	// Keep the unsnapped chain for GPU axes and copy static-axis origin from hybrid final.
++	Transform2D draw_xform = p_unsnapped_final_xform;
++	const Point2 canvas_origin = p_final_xform.columns[2];
++	Point2 draw_origin = draw_xform.columns[2];
++	if (!p_gpu_snap_x) {
++		draw_origin.x = canvas_origin.x;
++	}
++	if (!p_gpu_snap_y) {
++		draw_origin.y = canvas_origin.y;
++	}
++	draw_xform.columns[2] = draw_origin;
++	return draw_xform;
++}
++
++void RendererCanvasCull::_finalize_screen_transform_snap_axes(Item *p_item) {
++	if (!_viewport_uses_screen_transform_snap || p_item->skip_screen_transform_snap) {
++		p_item->screen_transform_snap_x = false;
++		p_item->screen_transform_snap_y = false;
++		return;
++	}
++
++	if (!_viewport_uses_screen_transform_snap_moving) {
++		p_item->screen_transform_snap_x = true;
++		p_item->screen_transform_snap_y = true;
++	}
++}
++
+ void RendererCanvasCull::_attach_canvas_item_for_draw(RendererCanvasCull::Item *ci, RendererCanvasCull::Item *p_canvas_clip, RendererCanvasRender::Item **r_z_list, RendererCanvasRender::Item **r_z_last_list, const Transform2D &p_transform, const Rect2 &p_clip_rect, Rect2 p_global_rect, const Color &p_modulate, int p_z, RendererCanvasCull::Item *p_material_owner, bool p_use_canvas_group, RendererCanvasRender::Item *r_canvas_group_from) {
+ 	if (ci->copy_back_buffer) {
+ 		ci->copy_back_buffer->screen_rect = p_transform.xform(ci->copy_back_buffer->rect).intersection(p_clip_rect);
+@@ -266,6 +402,7 @@ void RendererCanvasCull::_attach_canvas_item_for_draw(RendererCanvasCull::Item *
+ 
+ 		if (ci->commands != nullptr || ci->copy_back_buffer) {
+ 			ci->final_transform = !ci->use_identity_transform ? p_transform : _current_camera_transform;
++			_finalize_screen_transform_snap_axes(ci);
+ 			ci->final_modulate = p_modulate * ci->self_modulate;
+ 			ci->global_rect_cache = p_global_rect;
+ 			ci->global_rect_cache.position -= p_clip_rect.position;
+@@ -298,10 +435,11 @@ void RendererCanvasCull::_attach_canvas_item_for_draw(RendererCanvasCull::Item *
+ 	} else if (ci->repeat_source) {
+ 		// If repeat source does not draw itself it still needs transform updated as its child items' repeat offsets are relative to it.
+ 		ci->final_transform = p_transform;
++		_finalize_screen_transform_snap_axes(ci);
+ 	}
+ }
+ 
+-void RendererCanvasCull::_cull_canvas_item(Item *p_canvas_item, const Transform2D &p_parent_xform, const Rect2 &p_clip_rect, const Color &p_modulate, int p_z, RendererCanvasRender::Item **r_z_list, RendererCanvasRender::Item **r_z_last_list, Item *p_canvas_clip, Item *p_material_owner, bool p_is_already_y_sorted, uint32_t p_canvas_cull_mask, const Point2 &p_repeat_size, int p_repeat_times, RendererCanvasRender::Item *p_repeat_source_item) {
++void RendererCanvasCull::_cull_canvas_item(Item *p_canvas_item, const Transform2D &p_snapped_parent_xform, const Transform2D &p_unsnapped_parent_xform, const Rect2 &p_clip_rect, const Color &p_modulate, int p_z, RendererCanvasRender::Item **r_z_list, RendererCanvasRender::Item **r_z_last_list, Item *p_canvas_clip, Item *p_material_owner, bool p_is_already_y_sorted, uint32_t p_canvas_cull_mask, bool p_parent_uses_canvas_transform_snap, bool p_parent_uses_forced_screen_transform_snap, bool p_inherit_gpu_snap_x, bool p_inherit_gpu_snap_y, const Point2 &p_repeat_size, int p_repeat_times, RendererCanvasRender::Item *p_repeat_source_item) {
+ 	Item *ci = p_canvas_item;
+ 
+ 	if (!ci->visible) {
+@@ -330,6 +468,11 @@ void RendererCanvasCull::_cull_canvas_item(Item *p_canvas_item, const Transform2
+ 		return;
+ 	}
+ 
++	const bool uses_canvas_transform_snap = _item_uses_canvas_transform_snap(ci, p_parent_uses_canvas_transform_snap);
++	const bool uses_forced_screen_transform_snap = _item_uses_forced_screen_transform_snap(ci, p_parent_uses_forced_screen_transform_snap);
++	ci->use_canvas_transform_snap = uses_canvas_transform_snap;
++	ci->skip_screen_transform_snap = uses_canvas_transform_snap && _viewport_uses_screen_transform_snap;
++
+ 	Rect2 rect = ci->get_rect();
+ 
+ 	if (ci->visibility_notifier) {
+@@ -344,10 +487,28 @@ void RendererCanvasCull::_cull_canvas_item(Item *p_canvas_item, const Transform2
+ 	// we can override the transform for rendering purposes for this item only.
+ 	Transform2D self_xform;
+ 	Transform2D final_xform;
++	Transform2D unsnapped_final_xform;
+ 	if (p_is_already_y_sorted) {
+ 		// Y-sorted item's final transform is calculated before y-sorting,
+-		// and is passed as `p_parent_xform` afterwards. No need to recalculate.
+-		final_xform = p_parent_xform;
++		// and is passed as parent xforms afterwards. No need to recalculate.
++		unsnapped_final_xform = p_unsnapped_parent_xform;
++		final_xform = p_snapped_parent_xform;
++		if (!uses_canvas_transform_snap && uses_forced_screen_transform_snap && _viewport_uses_screen_transform_snap && !ci->skip_screen_transform_snap && !ci->use_identity_transform) {
++			ci->screen_transform_snap_x = true;
++			ci->screen_transform_snap_y = true;
++			final_xform = unsnapped_final_xform;
++		} else if (!uses_canvas_transform_snap && _viewport_uses_screen_transform_snap_moving && !ci->skip_screen_transform_snap && !ci->use_identity_transform) {
++			bool gpu_snap_x = false;
++			bool gpu_snap_y = false;
++			_apply_screen_transform_snap_moving(ci, unsnapped_final_xform, p_inherit_gpu_snap_x, p_inherit_gpu_snap_y, gpu_snap_x, gpu_snap_y);
++			if (!gpu_snap_x && !gpu_snap_y) {
++				_apply_render_origin_axis_canvas_snap(final_xform, true, true);
++			} else if (gpu_snap_x && gpu_snap_y) {
++				// Fully moving: leave the transform untouched for GPU screen snap.
++			} else {
++				_apply_render_origin_axis_canvas_snap(final_xform, !gpu_snap_x, !gpu_snap_y);
++			}
++		}
+ 	} else {
+ 		if (!_interpolation_data.interpolation_enabled || !ci->interpolated || !ci->on_interpolate_transform_list) {
+ 			self_xform = ci->xform_curr;
+@@ -356,14 +517,62 @@ void RendererCanvasCull::_cull_canvas_item(Item *p_canvas_item, const Transform2
+ 			TransformInterpolator::interpolate_transform_2d(ci->xform_prev, ci->xform_curr, self_xform, f);
+ 		}
+ 
+-		Transform2D parent_xform = p_parent_xform;
++		Transform2D snapped_parent_xform = p_snapped_parent_xform;
++		unsnapped_final_xform = p_unsnapped_parent_xform * self_xform;
+ 
+-		if (snapping_2d_transforms_to_pixel) {
++		if (uses_canvas_transform_snap) {
+ 			self_xform.columns[2] = (self_xform.columns[2] + Point2(0.5, 0.5)).floor();
+-			parent_xform.columns[2] = (parent_xform.columns[2] + Point2(0.5, 0.5)).floor();
++			snapped_parent_xform.columns[2] = (snapped_parent_xform.columns[2] + Point2(0.5, 0.5)).floor();
++			final_xform = snapped_parent_xform * self_xform;
++			ci->screen_transform_snap_x = false;
++			ci->screen_transform_snap_y = false;
++		} else if (uses_forced_screen_transform_snap && _viewport_uses_screen_transform_snap && !ci->skip_screen_transform_snap && !ci->use_identity_transform) {
++			ci->screen_transform_snap_x = true;
++			ci->screen_transform_snap_y = true;
++			final_xform = unsnapped_final_xform;
++		} else if (_viewport_uses_screen_transform_snap_moving && !ci->skip_screen_transform_snap && !ci->use_identity_transform) {
++			bool gpu_snap_x = false;
++			bool gpu_snap_y = false;
++			_apply_screen_transform_snap_moving(ci, unsnapped_final_xform, p_inherit_gpu_snap_x, p_inherit_gpu_snap_y, gpu_snap_x, gpu_snap_y);
++			if (gpu_snap_x && gpu_snap_y) {
++				final_xform = unsnapped_final_xform;
++			} else {
++				_apply_hybrid_canvas_transform_snap(self_xform, snapped_parent_xform, gpu_snap_x, gpu_snap_y);
++				final_xform = snapped_parent_xform * self_xform;
++			}
++		} else {
++			final_xform = snapped_parent_xform * self_xform;
++			if (!_viewport_uses_screen_transform_snap_moving) {
++				unsnapped_final_xform = final_xform;
++			}
+ 		}
++	}
+ 
+-		final_xform = parent_xform * self_xform;
++	// Static descendants need the cumulative canvas-snapped chain from hybrid final. Unsnapped is kept
++	// separately for movement detection only. Draw uses _build_screen_transform_snap_draw_xform().
++	Transform2D child_snapped_parent_xform = final_xform;
++	Transform2D child_unsnapped_parent_xform = final_xform;
++	if (_viewport_uses_screen_transform_snap_moving && !uses_canvas_transform_snap && !uses_forced_screen_transform_snap) {
++		child_unsnapped_parent_xform = unsnapped_final_xform;
++	}
++
++	Transform2D draw_xform = final_xform;
++	if (!uses_canvas_transform_snap && !ci->skip_screen_transform_snap && !ci->use_identity_transform) {
++		if (uses_forced_screen_transform_snap) {
++			draw_xform = unsnapped_final_xform;
++		} else if (_viewport_uses_screen_transform_snap_moving) {
++			draw_xform = _build_screen_transform_snap_draw_xform(final_xform, unsnapped_final_xform, ci->screen_transform_snap_x, ci->screen_transform_snap_y);
++		}
++	}
++
++	bool child_inherit_gpu_snap_x = false;
++	bool child_inherit_gpu_snap_y = false;
++	if (uses_forced_screen_transform_snap && !uses_canvas_transform_snap && !ci->skip_screen_transform_snap && !ci->use_identity_transform) {
++		child_inherit_gpu_snap_x = true;
++		child_inherit_gpu_snap_y = true;
++	} else if (_viewport_uses_screen_transform_snap_moving && !uses_canvas_transform_snap && !ci->skip_screen_transform_snap && !ci->use_identity_transform) {
++		child_inherit_gpu_snap_x = ci->screen_transform_snap_x;
++		child_inherit_gpu_snap_y = ci->screen_transform_snap_y;
+ 	}
+ 
+ 	Point2 repeat_size = p_repeat_size;
+@@ -382,7 +591,7 @@ void RendererCanvasCull::_cull_canvas_item(Item *p_canvas_item, const Transform2
+ 
+ 	Rect2 global_rect;
+ 	if (!p_canvas_item->use_identity_transform) {
+-		global_rect = final_xform.xform(rect);
++		global_rect = draw_xform.xform(rect);
+ 	} else {
+ 		global_rect = _current_camera_transform.xform(rect);
+ 	}
+@@ -450,13 +659,15 @@ void RendererCanvasCull::_cull_canvas_item(Item *p_canvas_item, const Transform2
+ 			ci->ysort_parent_abs_z_index = parent_z;
+ 			child_items[0] = ci;
+ 			int i = 1;
+-			_collect_ysort_children(ci, p_material_owner, Color(1, 1, 1, 1), child_items, i, child_item_count, p_z, p_canvas_cull_mask);
++			_collect_ysort_children(ci, p_material_owner, Color(1, 1, 1, 1), child_items, i, child_item_count, p_z, p_canvas_cull_mask, uses_canvas_transform_snap);
+ 
+ 			SortArray<Item *, ItemYSort> sorter;
+ 			sorter.sort(child_items, child_item_count);
+ 
+ 			for (i = 0; i < child_item_count; i++) {
+-				_cull_canvas_item(child_items[i], final_xform * child_items[i]->ysort_xform, p_clip_rect, modulate * child_items[i]->ysort_modulate, child_items[i]->ysort_parent_abs_z_index, r_z_list, r_z_last_list, (Item *)ci->final_clip_owner, (Item *)child_items[i]->material_owner, true, p_canvas_cull_mask, child_items[i]->repeat_size, child_items[i]->repeat_times, child_items[i]->repeat_source_item);
++				const bool child_uses_canvas_transform_snap = _item_uses_canvas_transform_snap(child_items[i], uses_canvas_transform_snap);
++				const bool child_uses_forced_screen_transform_snap = _item_uses_forced_screen_transform_snap(child_items[i], uses_forced_screen_transform_snap);
++				_cull_canvas_item(child_items[i], child_snapped_parent_xform * child_items[i]->ysort_xform, child_unsnapped_parent_xform * child_items[i]->ysort_xform, p_clip_rect, modulate * child_items[i]->ysort_modulate, child_items[i]->ysort_parent_abs_z_index, r_z_list, r_z_last_list, (Item *)ci->final_clip_owner, (Item *)child_items[i]->material_owner, true, p_canvas_cull_mask, child_uses_canvas_transform_snap, child_uses_forced_screen_transform_snap, child_inherit_gpu_snap_x, child_inherit_gpu_snap_y, child_items[i]->repeat_size, child_items[i]->repeat_times, child_items[i]->repeat_source_item);
+ 			}
+ 		} else {
+ 			RendererCanvasRender::Item *canvas_group_from = nullptr;
+@@ -466,7 +677,7 @@ void RendererCanvasCull::_cull_canvas_item(Item *p_canvas_item, const Transform2
+ 				canvas_group_from = r_z_last_list[zidx];
+ 			}
+ 
+-			_attach_canvas_item_for_draw(ci, p_canvas_clip, r_z_list, r_z_last_list, final_xform, p_clip_rect, global_rect, modulate, p_z, p_material_owner, use_canvas_group, canvas_group_from);
++			_attach_canvas_item_for_draw(ci, p_canvas_clip, r_z_list, r_z_last_list, draw_xform, p_clip_rect, global_rect, modulate, p_z, p_material_owner, use_canvas_group, canvas_group_from);
+ 		}
+ 	} else {
+ 		RendererCanvasRender::Item *canvas_group_from = nullptr;
+@@ -480,21 +691,28 @@ void RendererCanvasCull::_cull_canvas_item(Item *p_canvas_item, const Transform2
+ 			if (!child_items[i]->behind && !use_canvas_group) {
+ 				continue;
+ 			}
+-			_cull_canvas_item(child_items[i], final_xform, p_clip_rect, modulate, p_z, r_z_list, r_z_last_list, (Item *)ci->final_clip_owner, p_material_owner, false, p_canvas_cull_mask, repeat_size, repeat_times, repeat_source_item);
++			const bool child_uses_canvas_transform_snap = _item_uses_canvas_transform_snap(child_items[i], uses_canvas_transform_snap);
++			const bool child_uses_forced_screen_transform_snap = _item_uses_forced_screen_transform_snap(child_items[i], uses_forced_screen_transform_snap);
++			_cull_canvas_item(child_items[i], child_snapped_parent_xform, child_unsnapped_parent_xform, p_clip_rect, modulate, p_z, r_z_list, r_z_last_list, (Item *)ci->final_clip_owner, p_material_owner, false, p_canvas_cull_mask, child_uses_canvas_transform_snap, child_uses_forced_screen_transform_snap, child_inherit_gpu_snap_x, child_inherit_gpu_snap_y, repeat_size, repeat_times, repeat_source_item);
+ 		}
+-		_attach_canvas_item_for_draw(ci, p_canvas_clip, r_z_list, r_z_last_list, final_xform, p_clip_rect, global_rect, modulate, p_z, p_material_owner, use_canvas_group, canvas_group_from);
++		_attach_canvas_item_for_draw(ci, p_canvas_clip, r_z_list, r_z_last_list, draw_xform, p_clip_rect, global_rect, modulate, p_z, p_material_owner, use_canvas_group, canvas_group_from);
+ 		for (int i = 0; i < child_item_count; i++) {
+ 			if (child_items[i]->behind || use_canvas_group) {
+ 				continue;
+ 			}
+-			_cull_canvas_item(child_items[i], final_xform, p_clip_rect, modulate, p_z, r_z_list, r_z_last_list, (Item *)ci->final_clip_owner, p_material_owner, false, p_canvas_cull_mask, repeat_size, repeat_times, repeat_source_item);
++			const bool child_uses_canvas_transform_snap = _item_uses_canvas_transform_snap(child_items[i], uses_canvas_transform_snap);
++			const bool child_uses_forced_screen_transform_snap = _item_uses_forced_screen_transform_snap(child_items[i], uses_forced_screen_transform_snap);
++			_cull_canvas_item(child_items[i], child_snapped_parent_xform, child_unsnapped_parent_xform, p_clip_rect, modulate, p_z, r_z_list, r_z_last_list, (Item *)ci->final_clip_owner, p_material_owner, false, p_canvas_cull_mask, child_uses_canvas_transform_snap, child_uses_forced_screen_transform_snap, child_inherit_gpu_snap_x, child_inherit_gpu_snap_y, repeat_size, repeat_times, repeat_source_item);
+ 		}
+ 	}
+ }
+ 
+-void RendererCanvasCull::render_canvas(RID p_render_target, Canvas *p_canvas, const Transform2D &p_transform, RendererCanvasRender::Light *p_lights, RendererCanvasRender::Light *p_directional_lights, const Rect2 &p_clip_rect, RSE::CanvasItemTextureFilter p_default_filter, RSE::CanvasItemTextureRepeat p_default_repeat, bool p_snap_2d_transforms_to_pixel, bool p_snap_2d_vertices_to_pixel, uint32_t canvas_cull_mask, RenderingServerTypes::RenderInfo *r_render_info) {
++void RendererCanvasCull::render_canvas(RID p_render_target, Canvas *p_canvas, const Transform2D &p_transform, RendererCanvasRender::Light *p_lights, RendererCanvasRender::Light *p_directional_lights, const Rect2 &p_clip_rect, RSE::CanvasItemTextureFilter p_default_filter, RSE::CanvasItemTextureRepeat p_default_repeat, bool p_snap_2d_transforms_to_pixel, bool p_snap_2d_vertices_to_pixel, uint8_t p_snap_2d_transforms_method, uint32_t canvas_cull_mask, RenderingServerTypes::RenderInfo *r_render_info) {
+ 	sdf_used = false;
+-	snapping_2d_transforms_to_pixel = p_snap_2d_transforms_to_pixel;
++	_snap_2d_transforms_to_pixel = p_snap_2d_transforms_to_pixel;
++	_viewport_uses_canvas_transform_snap = RendererSnap2D::use_canvas_transform_snap(p_snap_2d_transforms_to_pixel, (RendererSnap2D::TransformSnapMethod)p_snap_2d_transforms_method);
++	_viewport_uses_screen_transform_snap = RendererSnap2D::use_screen_transform_snap(p_snap_2d_transforms_to_pixel, (RendererSnap2D::TransformSnapMethod)p_snap_2d_transforms_method);
++	_viewport_uses_screen_transform_snap_moving = RendererSnap2D::use_screen_transform_snap_moving(p_snap_2d_transforms_to_pixel, (RendererSnap2D::TransformSnapMethod)p_snap_2d_transforms_method);
+ 
+ 	if (p_canvas->children_order_dirty) {
+ 		p_canvas->child_items.sort();
+@@ -504,7 +722,7 @@ void RendererCanvasCull::render_canvas(RID p_render_target, Canvas *p_canvas, co
+ 	int l = p_canvas->child_items.size();
+ 	Canvas::ChildItem *ci = p_canvas->child_items.ptrw();
+ 
+-	_render_canvas_item_tree(p_render_target, ci, l, p_transform, p_clip_rect, p_canvas->modulate, p_lights, p_directional_lights, p_default_filter, p_default_repeat, p_snap_2d_vertices_to_pixel, canvas_cull_mask, r_render_info);
++	_render_canvas_item_tree(p_render_target, ci, l, p_transform, p_clip_rect, p_canvas->modulate, p_lights, p_directional_lights, p_default_filter, p_default_repeat, p_snap_2d_transforms_to_pixel, p_snap_2d_vertices_to_pixel, p_snap_2d_transforms_method, canvas_cull_mask, r_render_info);
+ }
+ 
+ bool RendererCanvasCull::was_sdf_used() {
+@@ -1829,6 +2047,8 @@ void RendererCanvasCull::canvas_item_add_particles(RID p_item, RID p_particles,
+ 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
+ 	ERR_FAIL_NULL(canvas_item);
+ 
++	canvas_item->has_particles = true;
++
+ 	Item::CommandParticles *part = canvas_item->alloc_command<Item::CommandParticles>();
+ 	ERR_FAIL_NULL(part);
+ 	part->particles = p_particles;
+@@ -2507,6 +2727,40 @@ void RendererCanvasCull::canvas_item_set_default_texture_repeat(RID p_item, RSE:
+ 	ci->texture_repeat = p_repeat;
+ }
+ 
++bool RendererCanvasCull::_item_uses_canvas_transform_snap(const Item *p_item, bool p_parent_uses_canvas_transform_snap) const {
++	if (!_snap_2d_transforms_to_pixel) {
++		return false;
++	}
++	if (p_item->snap_2d_transforms_mode == RendererSnap2D::SNAP_2D_TRANSFORMS_ITEM_CANVAS) {
++		return true;
++	}
++	return p_parent_uses_canvas_transform_snap;
++}
++
++bool RendererCanvasCull::_item_uses_forced_screen_transform_snap(const Item *p_item, bool p_parent_uses_forced_screen_transform_snap) const {
++	if (!_snap_2d_transforms_to_pixel || !_viewport_uses_screen_transform_snap || !_viewport_uses_screen_transform_snap_moving) {
++		return false;
++	}
++	if (p_item->snap_2d_transforms_mode == RendererSnap2D::SNAP_2D_TRANSFORMS_ITEM_SCREEN) {
++		return true;
++	}
++	if (p_item->snap_2d_transforms_mode == RendererSnap2D::SNAP_2D_TRANSFORMS_ITEM_CANVAS) {
++		return false;
++	}
++	// GPU particles need screen-space snap every frame; movement detection would leave them canvas-snapped when static.
++	if (p_item->has_particles) {
++		return true;
++	}
++	return p_parent_uses_forced_screen_transform_snap;
++}
++
++void RendererCanvasCull::canvas_item_set_snap_2d_transforms_mode(RID p_item, int p_mode) {
++	ERR_FAIL_INDEX(p_mode, RendererSnap2D::SNAP_2D_TRANSFORMS_ITEM_SCREEN + 1);
++	Item *ci = canvas_item_owner.get_or_null(p_item);
++	ERR_FAIL_NULL(ci);
++	ci->snap_2d_transforms_mode = p_mode;
++}
++
+ void RendererCanvasCull::update_visibility_notifiers() {
+ 	SelfList<Item::VisibilityNotifierData> *E = visibility_notifier_list.first();
+ 	while (E) {
+diff --git a/servers/rendering/renderer_canvas_cull.h b/servers/rendering/renderer_canvas_cull.h
+index de9b9290601667a05c144b30a9303db61a97413e..1b580d2cd04b7a9f51c517368972e3310051d460 100644
+--- a/servers/rendering/renderer_canvas_cull.h
++++ b/servers/rendering/renderer_canvas_cull.h
+@@ -194,7 +194,10 @@ public:
+ 
+ 	bool disable_scale;
+ 	bool sdf_used = false;
+-	bool snapping_2d_transforms_to_pixel = false;
++	bool _snap_2d_transforms_to_pixel = false;
++	bool _viewport_uses_canvas_transform_snap = false;
++	bool _viewport_uses_screen_transform_snap = false;
++	bool _viewport_uses_screen_transform_snap_moving = false;
+ 
+ 	bool debug_redraw = false;
+ 	double debug_redraw_time = 0;
+@@ -203,13 +206,24 @@ public:
+ 	PagedAllocator<Item::VisibilityNotifierData> visibility_notifier_allocator;
+ 	SelfList<Item::VisibilityNotifierData>::List visibility_notifier_list;
+ 
++	void _detect_screen_transform_snap_axes(Item *p_item, const Point2 &p_world_origin, bool &r_moving_x, bool &r_moving_y);
++	void _resolve_screen_transform_snap_axes(bool p_moving_x, bool p_moving_y, bool p_inherit_gpu_snap_x, bool p_inherit_gpu_snap_y, bool &r_gpu_snap_x, bool &r_gpu_snap_y);
++	void _apply_axis_canvas_transform_snap(Transform2D &p_self_xform, Transform2D &p_parent_xform, bool p_canvas_snap_x, bool p_canvas_snap_y);
++	void _apply_hybrid_canvas_transform_snap(Transform2D &p_self_xform, Transform2D &p_parent_xform, bool p_gpu_snap_x, bool p_gpu_snap_y);
++	void _apply_render_origin_axis_canvas_snap(Transform2D &p_final_xform, bool p_canvas_snap_x, bool p_canvas_snap_y);
++	Point2 _get_screen_transform_snap_world_origin(const Transform2D &p_final_xform) const;
++	void _apply_screen_transform_snap_moving(Item *p_item, const Transform2D &p_unsnapped_final_xform, bool p_inherit_gpu_snap_x, bool p_inherit_gpu_snap_y, bool &r_gpu_snap_x, bool &r_gpu_snap_y);
++	Transform2D _build_screen_transform_snap_draw_xform(const Transform2D &p_final_xform, const Transform2D &p_unsnapped_final_xform, bool p_gpu_snap_x, bool p_gpu_snap_y) const;
++	void _finalize_screen_transform_snap_axes(Item *p_item);
+ 	_FORCE_INLINE_ void _attach_canvas_item_for_draw(Item *ci, Item *p_canvas_clip, RendererCanvasRender::Item **r_z_list, RendererCanvasRender::Item **r_z_last_list, const Transform2D &p_transform, const Rect2 &p_clip_rect, Rect2 p_global_rect, const Color &modulate, int p_z, RendererCanvasCull::Item *p_material_owner, bool p_use_canvas_group, RendererCanvasRender::Item *r_canvas_group_from);
+ 
+ private:
+-	void _render_canvas_item_tree(RID p_to_render_target, Canvas::ChildItem *p_child_items, int p_child_item_count, const Transform2D &p_transform, const Rect2 &p_clip_rect, const Color &p_modulate, RendererCanvasRender::Light *p_lights, RendererCanvasRender::Light *p_directional_lights, RSE::CanvasItemTextureFilter p_default_filter, RSE::CanvasItemTextureRepeat p_default_repeat, bool p_snap_2d_vertices_to_pixel, uint32_t p_canvas_cull_mask, RenderingServerTypes::RenderInfo *r_render_info = nullptr);
+-	void _cull_canvas_item(Item *p_canvas_item, const Transform2D &p_parent_xform, const Rect2 &p_clip_rect, const Color &p_modulate, int p_z, RendererCanvasRender::Item **r_z_list, RendererCanvasRender::Item **r_z_last_list, Item *p_canvas_clip, Item *p_material_owner, bool p_is_already_y_sorted, uint32_t p_canvas_cull_mask, const Point2 &p_repeat_size, int p_repeat_times, RendererCanvasRender::Item *p_repeat_source_item);
++	void _render_canvas_item_tree(RID p_to_render_target, Canvas::ChildItem *p_child_items, int p_child_item_count, const Transform2D &p_transform, const Rect2 &p_clip_rect, const Color &p_modulate, RendererCanvasRender::Light *p_lights, RendererCanvasRender::Light *p_directional_lights, RSE::CanvasItemTextureFilter p_default_filter, RSE::CanvasItemTextureRepeat p_default_repeat, bool p_snap_2d_transforms_to_pixel, bool p_snap_2d_vertices_to_pixel, uint8_t p_snap_2d_transforms_method, uint32_t p_canvas_cull_mask, RenderingServerTypes::RenderInfo *r_render_info = nullptr);
++	void _cull_canvas_item(Item *p_canvas_item, const Transform2D &p_snapped_parent_xform, const Transform2D &p_unsnapped_parent_xform, const Rect2 &p_clip_rect, const Color &p_modulate, int p_z, RendererCanvasRender::Item **r_z_list, RendererCanvasRender::Item **r_z_last_list, Item *p_canvas_clip, Item *p_material_owner, bool p_is_already_y_sorted, uint32_t p_canvas_cull_mask, bool p_parent_uses_canvas_transform_snap, bool p_parent_uses_forced_screen_transform_snap, bool p_inherit_gpu_snap_x, bool p_inherit_gpu_snap_y, const Point2 &p_repeat_size, int p_repeat_times, RendererCanvasRender::Item *p_repeat_source_item);
+ 
+-	void _collect_ysort_children(RendererCanvasCull::Item *p_canvas_item, RendererCanvasCull::Item *p_material_owner, const Color &p_modulate, RendererCanvasCull::Item **r_items, int &r_index, int &r_ysort_children_count, int p_z, uint32_t p_canvas_cull_mask);
++	void _collect_ysort_children(RendererCanvasCull::Item *p_canvas_item, RendererCanvasCull::Item *p_material_owner, const Color &p_modulate, RendererCanvasCull::Item **r_items, int &r_index, int &r_ysort_children_count, int p_z, uint32_t p_canvas_cull_mask, bool p_parent_uses_canvas_transform_snap);
++	bool _item_uses_canvas_transform_snap(const Item *p_item, bool p_parent_uses_canvas_transform_snap) const;
++	bool _item_uses_forced_screen_transform_snap(const Item *p_item, bool p_parent_uses_forced_screen_transform_snap) const;
+ 	int _count_ysort_children(RendererCanvasCull::Item *p_canvas_item);
+ 	void _mark_ysort_dirty(RendererCanvasCull::Item *ysort_owner);
+ 
+@@ -221,7 +235,7 @@ private:
+ 	Transform2D _current_camera_transform;
+ 
+ public:
+-	void render_canvas(RID p_render_target, Canvas *p_canvas, const Transform2D &p_transform, RendererCanvasRender::Light *p_lights, RendererCanvasRender::Light *p_directional_lights, const Rect2 &p_clip_rect, RSE::CanvasItemTextureFilter p_default_filter, RSE::CanvasItemTextureRepeat p_default_repeat, bool p_snap_2d_transforms_to_pixel, bool p_snap_2d_vertices_to_pixel, uint32_t p_canvas_cull_mask, RenderingServerTypes::RenderInfo *r_render_info = nullptr);
++	void render_canvas(RID p_render_target, Canvas *p_canvas, const Transform2D &p_transform, RendererCanvasRender::Light *p_lights, RendererCanvasRender::Light *p_directional_lights, const Rect2 &p_clip_rect, RSE::CanvasItemTextureFilter p_default_filter, RSE::CanvasItemTextureRepeat p_default_repeat, bool p_snap_2d_transforms_to_pixel, bool p_snap_2d_vertices_to_pixel, uint8_t p_snap_2d_transforms_method, uint32_t p_canvas_cull_mask, RenderingServerTypes::RenderInfo *r_render_info = nullptr);
+ 
+ 	bool was_sdf_used();
+ 
+@@ -375,6 +389,7 @@ public:
+ 
+ 	void canvas_item_set_default_texture_filter(RID p_item, RSE::CanvasItemTextureFilter p_filter);
+ 	void canvas_item_set_default_texture_repeat(RID p_item, RSE::CanvasItemTextureRepeat p_repeat);
++	void canvas_item_set_snap_2d_transforms_mode(RID p_item, int p_mode);
+ 
+ 	void update_visibility_notifiers();
+ 	void update_dirty_items();
+diff --git a/servers/rendering/renderer_canvas_render.h b/servers/rendering/renderer_canvas_render.h
+index d452bc361159efb400032d03b4b42bfb3c9c90d0..6596a5e9ac748195df60bd61d431a50a7e58787f 100644
+--- a/servers/rendering/renderer_canvas_render.h
++++ b/servers/rendering/renderer_canvas_render.h
+@@ -30,6 +30,7 @@
+ 
+ #pragma once
+ 
++#include "servers/rendering/renderer_snap_2d.h"
+ #include "servers/rendering/rendering_server_enums.h"
+ #include "servers/rendering/rendering_server_types.h"
+ 
+@@ -366,10 +367,19 @@ public:
+ 		bool distance_field;
+ 		bool light_masked;
+ 		bool repeat_source;
++		bool has_particles = false;
+ 		Point2 repeat_size;
+ 		int repeat_times = 1;
+ 		Item *repeat_source_item = nullptr;
+ 
++		uint8_t snap_2d_transforms_mode = RendererSnap2D::SNAP_2D_TRANSFORMS_ITEM_INHERIT;
++		bool use_canvas_transform_snap = false;
++		bool skip_screen_transform_snap = false;
++		bool screen_transform_snap_x = false;
++		bool screen_transform_snap_y = false;
++		bool screen_transform_snap_world_origin_valid = false;
++		Point2 screen_transform_snap_world_origin_prev;
++
+ 		Rect2 global_rect_cache;
+ 
+ 		const Rect2 &get_rect() const;
+@@ -454,6 +464,7 @@ public:
+ 			last_command = nullptr;
+ 			commands = nullptr;
+ 			current_block = 0;
++			has_particles = false;
+ 			clip = false;
+ 			rect_dirty = true;
+ 			final_clip_owner = nullptr;
+@@ -503,7 +514,7 @@ public:
+ 		}
+ 	};
+ 
+-	virtual void canvas_render_items(RID p_to_render_target, Item *p_item_list, const Color &p_modulate, Light *p_light_list, Light *p_directional_list, const Transform2D &p_canvas_transform, RSE::CanvasItemTextureFilter p_default_filter, RSE::CanvasItemTextureRepeat p_default_repeat, bool p_snap_2d_vertices_to_pixel, bool &r_sdf_used, RenderingServerTypes::RenderInfo *r_render_info = nullptr) = 0;
++	virtual void canvas_render_items(RID p_to_render_target, Item *p_item_list, const Color &p_modulate, Light *p_light_list, Light *p_directional_list, const Transform2D &p_canvas_transform, RSE::CanvasItemTextureFilter p_default_filter, RSE::CanvasItemTextureRepeat p_default_repeat, bool p_snap_2d_transforms_to_pixel, bool p_snap_2d_vertices_to_pixel, uint8_t p_snap_2d_transforms_method, bool &r_sdf_used, RenderingServerTypes::RenderInfo *r_render_info = nullptr) = 0;
+ 
+ 	struct LightOccluderInstance {
+ 		bool enabled : 1;
+diff --git a/servers/rendering/renderer_rd/renderer_canvas_render_rd.cpp b/servers/rendering/renderer_rd/renderer_canvas_render_rd.cpp
+index fad67ae1a370f292ef5c09aa23b69aa339a6d39c..0dac348b88f2c51ef571dd79a30381115e13bcda 100644
+--- a/servers/rendering/renderer_rd/renderer_canvas_render_rd.cpp
++++ b/servers/rendering/renderer_rd/renderer_canvas_render_rd.cpp
+@@ -42,6 +42,7 @@
+ #include "servers/rendering/renderer_rd/storage_rd/particles_storage.h"
+ #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
+ #include "servers/rendering/rendering_server_default.h"
++#include "servers/rendering/renderer_snap_2d.h"
+ 
+ void RendererCanvasRenderRD::_update_transform_2d_to_mat4(const Transform2D &p_transform, float *p_mat4) {
+ 	p_mat4[0] = p_transform.columns[0][0];
+@@ -506,7 +507,7 @@ RID RendererCanvasRenderRD::_get_pipeline_specialization_or_ubershader(CanvasSha
+ 	return RID();
+ }
+ 
+-void RendererCanvasRenderRD::canvas_render_items(RID p_to_render_target, Item *p_item_list, const Color &p_modulate, Light *p_light_list, Light *p_directional_light_list, const Transform2D &p_canvas_transform, RSE::CanvasItemTextureFilter p_default_filter, RSE::CanvasItemTextureRepeat p_default_repeat, bool p_snap_2d_vertices_to_pixel, bool &r_sdf_used, RenderingServerTypes::RenderInfo *r_render_info) {
++void RendererCanvasRenderRD::canvas_render_items(RID p_to_render_target, Item *p_item_list, const Color &p_modulate, Light *p_light_list, Light *p_directional_light_list, const Transform2D &p_canvas_transform, RSE::CanvasItemTextureFilter p_default_filter, RSE::CanvasItemTextureRepeat p_default_repeat, bool p_snap_2d_transforms_to_pixel, bool p_snap_2d_vertices_to_pixel, uint8_t p_snap_2d_transforms_method, bool &r_sdf_used, RenderingServerTypes::RenderInfo *r_render_info) {
+ 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
+ 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
+ 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+@@ -705,6 +706,12 @@ void RendererCanvasRenderRD::canvas_render_items(RID p_to_render_target, Item *p
+ 		state_buffer.time = state.time;
+ 		state_buffer.use_pixel_snap = p_snap_2d_vertices_to_pixel;
+ 
++		uint32_t canvas_flags = use_linear_colors ? CANVAS_FLAGS_CONVERT_ATTRIBUTES_TO_LINEAR : 0;
++		if (RendererSnap2D::use_screen_transform_snap(p_snap_2d_transforms_to_pixel, (RendererSnap2D::TransformSnapMethod)p_snap_2d_transforms_method)) {
++			canvas_flags |= CANVAS_FLAGS_USE_TRANSFORM_PIXEL_SNAP;
++		}
++		state_buffer.flags = canvas_flags;
++
+ 		state_buffer.directional_light_count = directional_light_count;
+ 
+ 		Vector2 canvas_scale = p_canvas_transform.get_scale();
+@@ -727,8 +734,6 @@ void RendererCanvasRenderRD::canvas_render_items(RID p_to_render_target, Item *p
+ 		state_buffer.tex_to_sdf = 1.0 / ((canvas_scale.x + canvas_scale.y) * 0.5);
+ 		state_buffer.shadow_pixel_size = 1.0f / (float)(state.shadow_texture_size);
+ 
+-		state_buffer.flags = use_linear_colors ? CANVAS_FLAGS_CONVERT_ATTRIBUTES_TO_LINEAR : 0;
+-
+ 		RD::get_singleton()->buffer_update(state.canvas_state_buffer, 0, sizeof(State::Buffer), &state_buffer);
+ 	}
+ 
+@@ -2390,6 +2395,16 @@ void RendererCanvasRenderRD::_record_item_commands(const Item *p_item, RenderTar
+ 		template_instance.flags |= shadow_mask << INSTANCE_FLAGS_SHADOW_MASKED_SHIFT;
+ 	}
+ 
++	if (p_item->skip_screen_transform_snap) {
++		template_instance.flags |= INSTANCE_FLAGS_SKIP_SCREEN_TRANSFORM_SNAP;
++	}
++	if (p_item->screen_transform_snap_x) {
++		template_instance.flags |= INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_X;
++	}
++	if (p_item->screen_transform_snap_y) {
++		template_instance.flags |= INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_Y;
++	}
++
+ 	bool use_lighting = (light_count > 0 || using_directional_lights);
+ 
+ 	if (use_lighting != r_current_batch->use_lighting) {
+diff --git a/servers/rendering/renderer_rd/renderer_canvas_render_rd.h b/servers/rendering/renderer_rd/renderer_canvas_render_rd.h
+index dbdddafe6232ba587c12775255b45e18b624f5cd..371f1336b794fa4237f4fadd3fa7553a3415f2e9 100644
+--- a/servers/rendering/renderer_rd/renderer_canvas_render_rd.h
++++ b/servers/rendering/renderer_rd/renderer_canvas_render_rd.h
+@@ -74,6 +74,9 @@ class RendererCanvasRenderRD : public RendererCanvasRender {
+ 		INSTANCE_FLAGS_NINEPATCH_V_MODE_SHIFT = 11,
+ 
+ 		INSTANCE_FLAGS_SHADOW_MASKED_SHIFT = 13, // 16 bits.
++		INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_X = (1 << 30),
++		INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_Y = (1 << 31),
++		INSTANCE_FLAGS_SKIP_SCREEN_TRANSFORM_SNAP = (1 << 29),
+ 	};
+ 
+ 	enum {
+@@ -87,6 +90,7 @@ class RendererCanvasRenderRD : public RendererCanvasRender {
+ 
+ 	enum {
+ 		CANVAS_FLAGS_CONVERT_ATTRIBUTES_TO_LINEAR = (1 << 0),
++		CANVAS_FLAGS_USE_TRANSFORM_PIXEL_SNAP = (1 << 1),
+ 	};
+ 
+ 	enum {
+@@ -709,7 +713,7 @@ public:
+ 	void occluder_polygon_set_shape(RID p_occluder, const Vector<Vector2> &p_points, bool p_closed) override;
+ 	void occluder_polygon_set_cull_mode(RID p_occluder, RSE::CanvasOccluderPolygonCullMode p_mode) override;
+ 
+-	void canvas_render_items(RID p_to_render_target, Item *p_item_list, const Color &p_modulate, Light *p_light_list, Light *p_directional_light_list, const Transform2D &p_canvas_transform, RSE::CanvasItemTextureFilter p_default_filter, RSE::CanvasItemTextureRepeat p_default_repeat, bool p_snap_2d_vertices_to_pixel, bool &r_sdf_used, RenderingServerTypes::RenderInfo *r_render_info = nullptr) override;
++	void canvas_render_items(RID p_to_render_target, Item *p_item_list, const Color &p_modulate, Light *p_light_list, Light *p_directional_light_list, const Transform2D &p_canvas_transform, RSE::CanvasItemTextureFilter p_default_filter, RSE::CanvasItemTextureRepeat p_default_repeat, bool p_snap_2d_transforms_to_pixel, bool p_snap_2d_vertices_to_pixel, uint8_t p_snap_2d_transforms_method, bool &r_sdf_used, RenderingServerTypes::RenderInfo *r_render_info = nullptr) override;
+ 
+ 	virtual void set_shadow_texture_size(int p_size) override;
+ 
+diff --git a/servers/rendering/renderer_rd/shaders/canvas.glsl b/servers/rendering/renderer_rd/shaders/canvas.glsl
+index 20453071f8a6c0e8fedf10deeb3ae47cf6ad9b56..a24184e66964b1ecc8cae22da0accce0dbe48514 100644
+--- a/servers/rendering/renderer_rd/shaders/canvas.glsl
++++ b/servers/rendering/renderer_rd/shaders/canvas.glsl
+@@ -286,6 +286,20 @@ void main() {
+ 
+ 	vertex = (canvas_data.canvas_transform * vec4(vertex, 0.0, 1.0)).xy;
+ 
++	if (bool(canvas_data.flags & CANVAS_FLAGS_USE_TRANSFORM_PIXEL_SNAP) && !bool(read_draw_data_flags & INSTANCE_FLAGS_SKIP_SCREEN_TRANSFORM_SNAP)) {
++		vec2 transform_origin = (canvas_data.canvas_transform * model_matrix * vec4(0.0, 0.0, 0.0, 1.0)).xy;
++		vec2 snapped_origin = transform_origin;
++		if (bool(read_draw_data_flags & INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_X)) {
++			snapped_origin.x = floor(transform_origin.x + 0.5);
++		}
++		if (bool(read_draw_data_flags & INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_Y)) {
++			snapped_origin.y = floor(transform_origin.y + 0.5);
++		}
++		vertex += snapped_origin - transform_origin;
++		// Precision issue on some hardware creates artifacts within texture.
++		uv += 1e-5;
++	}
++
+ 	if (canvas_data.use_pixel_snap) {
+ 		vertex = floor(vertex + 0.5);
+ 		// precision issue on some hardware creates artifacts within texture
+diff --git a/servers/rendering/renderer_rd/shaders/canvas_uniforms_inc.glsl b/servers/rendering/renderer_rd/shaders/canvas_uniforms_inc.glsl
+index 8d8e07c228a43e8a5cddea236116af8418b36926..f5a6704640e507a54c4d3f80e8c0b4c9c2c6d02a 100644
+--- a/servers/rendering/renderer_rd/shaders/canvas_uniforms_inc.glsl
++++ b/servers/rendering/renderer_rd/shaders/canvas_uniforms_inc.glsl
+@@ -15,6 +15,9 @@
+ 
+ #define INSTANCE_FLAGS_SHADOW_MASKED_SHIFT 13 // 16 bits.
+ #define INSTANCE_FLAGS_SHADOW_MASKED (1 << INSTANCE_FLAGS_SHADOW_MASKED_SHIFT)
++#define INSTANCE_FLAGS_SKIP_SCREEN_TRANSFORM_SNAP (1u << 29)
++#define INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_X (1u << 30)
++#define INSTANCE_FLAGS_SCREEN_TRANSFORM_SNAP_Y (1u << 31)
+ 
+ struct InstanceData {
+ 	vec2 world_x;
+@@ -112,6 +115,7 @@ bool sc_use_lcd() {
+ /* SET0: Globals */
+ 
+ #define CANVAS_FLAGS_CONVERT_ATTRIBUTES_TO_LINEAR (1 << 0)
++#define CANVAS_FLAGS_USE_TRANSFORM_PIXEL_SNAP (1 << 1)
+ 
+ // The values passed per draw primitives are cached within it
+ 
+diff --git a/servers/rendering/renderer_snap_2d.h b/servers/rendering/renderer_snap_2d.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..1aea5a1ba36258114c977bfd3cfa8435a17c5abc
+--- /dev/null
++++ b/servers/rendering/renderer_snap_2d.h
+@@ -0,0 +1,65 @@
++/**************************************************************************/
++/*  renderer_snap_2d.h                                                  */
++/**************************************************************************/
++/*                         This file is part of:                          */
++/*                             GODOT ENGINE                               */
++/*                        https://godotengine.org                         */
++/**************************************************************************/
++/* Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md). */
++/* Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.                  */
++/*                                                                        */
++/* Permission is hereby granted, free of charge, to any person obtaining  */
++/* a copy of this software and associated documentation files (the        */
++/* "Software"), to deal in the Software without restriction, including    */
++/* without limitation the rights to use, copy, modify, merge, publish,    */
++/* distribute, sublicense, and/or sell copies of the Software, and to     */
++/* permit persons to whom the Software is furnished to do so, subject to  */
++/* the following conditions:                                              */
++/*                                                                        */
++/* The above copyright notice and this permission notice shall be         */
++/* included in all copies or substantial portions of the Software.        */
++/*                                                                        */
++/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,        */
++/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF     */
++/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
++/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
++/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,    */
++/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
++/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                   */
++/**************************************************************************/
++
++#pragma once
++
++#include "core/typedefs.h"
++
++class RendererSnap2D {
++public:
++	enum TransformSnapMethod : uint8_t {
++		TRANSFORM_SNAP_CANVAS = 0,
++		TRANSFORM_SNAP_SCREEN = 1,
++		TRANSFORM_SNAP_SCREEN_MOVING = 2,
++	};
++
++	enum Snap2DTransformsItemMode : uint8_t {
++		SNAP_2D_TRANSFORMS_ITEM_INHERIT = 0,
++		SNAP_2D_TRANSFORMS_ITEM_CANVAS = 1,
++		SNAP_2D_TRANSFORMS_ITEM_SCREEN = 2,
++	};
++
++	static constexpr float SCREEN_TRANSFORM_SNAP_MOVING_EPSILON = 0.01f;
++	// CharacterBody floor resolution can oscillate ~0.017 px on the secondary axis while
++	// moving on the primary axis. Suppress GPU snap on such an axis when another axis dominates.
++	static constexpr float SCREEN_TRANSFORM_SNAP_MOVING_JITTER_EPSILON = 0.02f;
++
++	static bool use_canvas_transform_snap(bool p_snap_2d_transforms_to_pixel, TransformSnapMethod p_method) {
++		return p_snap_2d_transforms_to_pixel && p_method == TRANSFORM_SNAP_CANVAS;
++	}
++
++	static bool use_screen_transform_snap(bool p_snap_2d_transforms_to_pixel, TransformSnapMethod p_method) {
++		return p_snap_2d_transforms_to_pixel && (p_method == TRANSFORM_SNAP_SCREEN || p_method == TRANSFORM_SNAP_SCREEN_MOVING);
++	}
++
++	static bool use_screen_transform_snap_moving(bool p_snap_2d_transforms_to_pixel, TransformSnapMethod p_method) {
++		return p_snap_2d_transforms_to_pixel && p_method == TRANSFORM_SNAP_SCREEN_MOVING;
++	}
++};
+diff --git a/servers/rendering/renderer_viewport.cpp b/servers/rendering/renderer_viewport.cpp
+index 8098fea0269b241b063afaa461c8fe8944f07c7a..5998c7539a69bb72633144879d344561c274f445 100644
+--- a/servers/rendering/renderer_viewport.cpp
++++ b/servers/rendering/renderer_viewport.cpp
+@@ -30,6 +30,8 @@
+ 
+ #include "renderer_viewport.h"
+ 
++#include "renderer_snap_2d.h"
++
+ #include "core/config/engine.h"
+ #include "core/config/project_settings.h"
+ #include "core/math/transform_interpolator.h"
+@@ -54,7 +56,7 @@ static Transform2D _canvas_get_transform(RendererViewport::Viewport *p_viewport,
+ 	Transform2D xf = p_viewport->global_transform;
+ 
+ 	Vector2 pixel_snap_offset;
+-	if (p_viewport->snap_2d_transforms_to_pixel) {
++	if (RendererSnap2D::use_canvas_transform_snap(p_viewport->snap_2d_transforms_to_pixel, (RendererSnap2D::TransformSnapMethod)p_viewport->snap_2d_transforms_method)) {
+ 		// We use `floor(p + 0.5)` to snap canvas items, but `ceil(p - 0.5)`
+ 		// to snap viewport transform because the viewport transform is inverse
+ 		// to the camera transform. Also, if the viewport size is not divisible
+@@ -65,9 +67,10 @@ static Transform2D _canvas_get_transform(RendererViewport::Viewport *p_viewport,
+ 	}
+ 
+ 	float scale = 1.0;
++	const bool canvas_transform_snap = RendererSnap2D::use_canvas_transform_snap(p_viewport->snap_2d_transforms_to_pixel, (RendererSnap2D::TransformSnapMethod)p_viewport->snap_2d_transforms_method);
+ 	if (p_viewport->canvas_map.has(p_canvas->parent)) {
+ 		Transform2D c_xform = p_viewport->canvas_map[p_canvas->parent].transform;
+-		if (p_viewport->snap_2d_transforms_to_pixel) {
++		if (canvas_transform_snap) {
+ 			c_xform.columns[2] = (c_xform.columns[2] * p_canvas->parent_scale + pixel_snap_offset).ceil() / p_canvas->parent_scale;
+ 		}
+ 		xf = xf * c_xform;
+@@ -75,7 +78,7 @@ static Transform2D _canvas_get_transform(RendererViewport::Viewport *p_viewport,
+ 	}
+ 
+ 	Transform2D c_xform = p_canvas_data->transform;
+-	if (p_viewport->snap_2d_transforms_to_pixel) {
++	if (canvas_transform_snap) {
+ 		c_xform.columns[2] = (c_xform.columns[2] + pixel_snap_offset).ceil();
+ 	}
+ 	xf = xf * c_xform;
+@@ -711,7 +714,7 @@ void RendererViewport::_draw_viewport(Viewport *p_viewport) {
+ 
+ 			RENDER_TIMESTAMP("> Render Canvas " + itos(canvas_idx));
+ 
+-			RSG::canvas->render_canvas(p_viewport->render_target, canvas, xform, canvas_lights, canvas_directional_lights, clip_rect, p_viewport->texture_filter, p_viewport->texture_repeat, p_viewport->snap_2d_transforms_to_pixel, p_viewport->snap_2d_vertices_to_pixel, p_viewport->canvas_cull_mask, &p_viewport->render_info);
++			RSG::canvas->render_canvas(p_viewport->render_target, canvas, xform, canvas_lights, canvas_directional_lights, clip_rect, p_viewport->texture_filter, p_viewport->texture_repeat, p_viewport->snap_2d_transforms_to_pixel, p_viewport->snap_2d_vertices_to_pixel, p_viewport->snap_2d_transforms_method, p_viewport->canvas_cull_mask, &p_viewport->render_info);
+ 
+ 			RENDER_TIMESTAMP("< Render Canvas " + itos(canvas_idx));
+ 
+@@ -1595,6 +1598,19 @@ void RendererViewport::viewport_set_snap_2d_transforms_to_pixel(RID p_viewport,
+ 	viewport->snap_2d_transforms_to_pixel = p_enabled;
+ }
+ 
++void RendererViewport::viewport_set_snap_2d_transforms_method(RID p_viewport, int p_method) {
++	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
++	ERR_FAIL_NULL(viewport);
++	ERR_FAIL_COND(p_method < RendererSnap2D::TRANSFORM_SNAP_CANVAS || p_method > RendererSnap2D::TRANSFORM_SNAP_SCREEN_MOVING);
++	viewport->snap_2d_transforms_method = p_method;
++}
++
++RendererSnap2D::TransformSnapMethod RendererViewport::viewport_get_snap_2d_transforms_method(RID p_viewport) const {
++	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
++	ERR_FAIL_NULL_V(viewport, RendererSnap2D::TRANSFORM_SNAP_CANVAS);
++	return (RendererSnap2D::TransformSnapMethod)viewport->snap_2d_transforms_method;
++}
++
+ void RendererViewport::viewport_set_snap_2d_vertices_to_pixel(RID p_viewport, bool p_enabled) {
+ 	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
+ 	ERR_FAIL_NULL(viewport);
+diff --git a/servers/rendering/renderer_viewport.h b/servers/rendering/renderer_viewport.h
+index 2c70de5eb8942840f46d0ee7b12951ae8428b4af..08b7efe8e7ceb66f999eea913e046d321bd484a2 100644
+--- a/servers/rendering/renderer_viewport.h
++++ b/servers/rendering/renderer_viewport.h
+@@ -33,6 +33,7 @@
+ #include "core/templates/rid_owner.h"
+ #include "servers/display/display_server_enums.h"
+ #include "servers/rendering/renderer_scene_render.h"
++#include "servers/rendering/renderer_snap_2d.h"
+ #include "servers/rendering/rendering_server_enums.h"
+ #include "servers/rendering/rendering_server_types.h"
+ #include "servers/rendering/storage/render_scene_buffers.h"
+@@ -91,6 +92,7 @@ public:
+ 
+ 		bool snap_2d_transforms_to_pixel = false;
+ 		bool snap_2d_vertices_to_pixel = false;
++		uint8_t snap_2d_transforms_method = RendererSnap2D::TRANSFORM_SNAP_CANVAS;
+ 
+ 		uint64_t time_cpu_begin;
+ 		uint64_t time_cpu_end;
+@@ -174,6 +176,7 @@ public:
+ 
+ 			snap_2d_transforms_to_pixel = false;
+ 			snap_2d_vertices_to_pixel = false;
++			snap_2d_transforms_method = RendererSnap2D::TRANSFORM_SNAP_CANVAS;
+ 
+ 			use_xr = false;
+ 			sdf_active = false;
+@@ -294,6 +297,8 @@ public:
+ 	float viewport_get_measured_render_time_gpu(RID p_viewport) const;
+ 
+ 	void viewport_set_snap_2d_transforms_to_pixel(RID p_viewport, bool p_enabled);
++	void viewport_set_snap_2d_transforms_method(RID p_viewport, int p_method);
++	RendererSnap2D::TransformSnapMethod viewport_get_snap_2d_transforms_method(RID p_viewport) const;
+ 	void viewport_set_snap_2d_vertices_to_pixel(RID p_viewport, bool p_enabled);
+ 
+ 	void viewport_set_default_canvas_item_texture_filter(RID p_viewport, RSE::CanvasItemTextureFilter p_filter);
+diff --git a/servers/rendering/rendering_server.cpp b/servers/rendering/rendering_server.cpp
+index d2b235f8e34fa23a6bb165afcc05d12d7f5327d8..3503ef9bb67c299921e450cff8ea3588a2f7d342 100644
+--- a/servers/rendering/rendering_server.cpp
++++ b/servers/rendering/rendering_server.cpp
+@@ -2877,6 +2877,7 @@ void RenderingServer::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("viewport_attach_canvas", "viewport", "canvas"), &RenderingServer::viewport_attach_canvas);
+ 	ClassDB::bind_method(D_METHOD("viewport_remove_canvas", "viewport", "canvas"), &RenderingServer::viewport_remove_canvas);
+ 	ClassDB::bind_method(D_METHOD("viewport_set_snap_2d_transforms_to_pixel", "viewport", "enabled"), &RenderingServer::viewport_set_snap_2d_transforms_to_pixel);
++	ClassDB::bind_method(D_METHOD("viewport_set_snap_2d_transforms_method", "viewport", "method"), &RenderingServer::viewport_set_snap_2d_transforms_method);
+ 	ClassDB::bind_method(D_METHOD("viewport_set_snap_2d_vertices_to_pixel", "viewport", "enabled"), &RenderingServer::viewport_set_snap_2d_vertices_to_pixel);
+ 
+ 	ClassDB::bind_method(D_METHOD("viewport_set_default_canvas_item_texture_filter", "viewport", "filter"), &RenderingServer::viewport_set_default_canvas_item_texture_filter);
+@@ -3316,6 +3317,7 @@ void RenderingServer::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("canvas_item_set_parent", "item", "parent"), &RenderingServer::canvas_item_set_parent);
+ 	ClassDB::bind_method(D_METHOD("canvas_item_set_default_texture_filter", "item", "filter"), &RenderingServer::canvas_item_set_default_texture_filter);
+ 	ClassDB::bind_method(D_METHOD("canvas_item_set_default_texture_repeat", "item", "repeat"), &RenderingServer::canvas_item_set_default_texture_repeat);
++	ClassDB::bind_method(D_METHOD("canvas_item_set_snap_2d_transforms_mode", "item", "mode"), &RenderingServer::canvas_item_set_snap_2d_transforms_mode);
+ 	ClassDB::bind_method(D_METHOD("canvas_item_set_visible", "item", "visible"), &RenderingServer::canvas_item_set_visible);
+ 	ClassDB::bind_method(D_METHOD("canvas_item_set_light_mask", "item", "mask"), &RenderingServer::canvas_item_set_light_mask);
+ 	ClassDB::bind_method(D_METHOD("canvas_item_set_visibility_layer", "item", "visibility_layer"), &RenderingServer::canvas_item_set_visibility_layer);
+diff --git a/servers/rendering/rendering_server.h b/servers/rendering/rendering_server.h
+index 4a5f852bcd1936aec7737935a06654cb63f93a1e..d93ce3188ad742c43fa5ab38ce4e8ef96d62b519 100644
+--- a/servers/rendering/rendering_server.h
++++ b/servers/rendering/rendering_server.h
+@@ -574,6 +574,7 @@ public:
+ 	virtual void viewport_set_use_hdr_2d(RID p_viewport, bool p_use_hdr) = 0;
+ 	virtual bool viewport_is_using_hdr_2d(RID p_viewport) const = 0;
+ 	virtual void viewport_set_snap_2d_transforms_to_pixel(RID p_viewport, bool p_enabled) = 0;
++	virtual void viewport_set_snap_2d_transforms_method(RID p_viewport, int p_method) = 0;
+ 	virtual void viewport_set_snap_2d_vertices_to_pixel(RID p_viewport, bool p_enabled) = 0;
+ 
+ 	virtual void viewport_set_default_canvas_item_texture_filter(RID p_viewport, RSE::CanvasItemTextureFilter p_filter) = 0;
+@@ -801,6 +802,7 @@ public:
+ 
+ 	virtual void canvas_item_set_default_texture_filter(RID p_item, RSE::CanvasItemTextureFilter p_filter) = 0;
+ 	virtual void canvas_item_set_default_texture_repeat(RID p_item, RSE::CanvasItemTextureRepeat p_repeat) = 0;
++	virtual void canvas_item_set_snap_2d_transforms_mode(RID p_item, int p_mode) = 0;
+ 
+ 	virtual void canvas_item_set_visible(RID p_item, bool p_visible) = 0;
+ 	virtual void canvas_item_set_light_mask(RID p_item, int p_mask) = 0;
+diff --git a/servers/rendering/rendering_server_default.h b/servers/rendering/rendering_server_default.h
+index 30d52d8e891a17c488111a72dd9b48418c1ab762..162be8771c629191d47c6d8fe148d28e7326f960 100644
+--- a/servers/rendering/rendering_server_default.h
++++ b/servers/rendering/rendering_server_default.h
+@@ -774,6 +774,7 @@ public:
+ 	FUNC2(viewport_set_use_hdr_2d, RID, bool)
+ 	FUNC1RC(bool, viewport_is_using_hdr_2d, RID)
+ 	FUNC2(viewport_set_snap_2d_transforms_to_pixel, RID, bool)
++	FUNC2(viewport_set_snap_2d_transforms_method, RID, int)
+ 	FUNC2(viewport_set_snap_2d_vertices_to_pixel, RID, bool)
+ 
+ 	FUNC2(viewport_set_default_canvas_item_texture_filter, RID, RSE::CanvasItemTextureFilter)
+@@ -1006,6 +1007,7 @@ public:
+ 
+ 	FUNC2(canvas_item_set_default_texture_filter, RID, RSE::CanvasItemTextureFilter)
+ 	FUNC2(canvas_item_set_default_texture_repeat, RID, RSE::CanvasItemTextureRepeat)
++	FUNC2(canvas_item_set_snap_2d_transforms_mode, RID, int)
+ 
+ 	FUNC2(canvas_item_set_visible, RID, bool)
+ 	FUNC2(canvas_item_set_light_mask, RID, int)
