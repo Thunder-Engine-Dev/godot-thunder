@@ -1,6 +1,6 @@
 # godot-thunder
 
-Patch set for Godot used by Thunder Engine. No Godot fork: upstream is cloned in CI, `patches/` is applied on top, and editor + export templates are built.
+Patch set for Godot used by Thunder Engine. No Godot fork: upstream is cloned in CI, `patches/` is applied on top, and editors (Linux/Windows) plus export templates (Linux/Windows/Android) are built.
 
 ## Layout
 
@@ -19,7 +19,7 @@ Actions → *Build Thunder Godot* → Run workflow. Pick the branch of this repo
 - `build_name` — build name baked into the editor/templates (default `thunder`, shown in the About dialog; templates are looked up without it)
 - `publish` — create a GitHub release (editor zips, `.tpz` export templates, SHA512 sums)
 
-Builds mirror godotengine/build-containers + godot-build-scripts (no signing): `fedora:43` container, Linux via the Godot buildroot SDK, Windows via MinGW GCC (`use_mingw=yes`, D3D12, ANGLE, Mesa/NIR, AccessKit), flags `production=yes`. Dependency versions are pinned in the workflow `env` from the matching branch (e.g. `4.7`) of those repos; update them when moving to a new Godot branch. Targets: Linux and Windows x86_64, editor + debug/release templates, no Mono.
+Builds mirror godotengine/build-containers + godot-build-scripts (no signing): `fedora:43` container, Linux via the Godot buildroot SDK, Windows via MinGW GCC (`use_mingw=yes`, D3D12, ANGLE, Mesa/NIR, AccessKit), Android via the SDK/NDK + Gradle template packaging (`swappy=yes`), flags `production=yes`. Dependency versions are pinned in the workflow `env` from the matching branch (e.g. `4.7`) of those repos; update them when moving to a new Godot branch. Targets: Linux and Windows x86_64, editor + debug/release templates; Android arm32/arm64/x86_32/x86_64 debug/release templates (no editor). No Mono.
 
 ## Adding / updating patches
 

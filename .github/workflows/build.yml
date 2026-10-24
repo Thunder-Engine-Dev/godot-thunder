@@ -38,6 +38,14 @@ env:
   ANGLE_RELEASE: chromium%2F7578
   MESA_RELEASE: 25.3.1-3
   SCONS_VERSION: "4.10.1"
+  # Android SDK packages, kept in sync with the 4.7 branch's
+  # platform/android/java/app/config.gradle and platform/android/detect.py.
+  ANDROID_HOME: /root/sdk
+  ANDROID_SDK_ROOT: /root/sdk
+  ANDROID_CMDLINE_TOOLS: commandlinetools-linux-13114758_latest.zip
+  ANDROID_NDK_VERSION: "29.0.14206865"
+  ANDROID_BUILD_TOOLS: "36.1.0"
+  ANDROID_PLATFORM: android-36
 
 jobs:
   check-patches:
@@ -161,9 +169,142 @@ jobs:
           path: out/*
           if-no-files-found: error
 
+  build-android:
+    name: Android template (${{ matrix.arch }})
+    needs: check-patches
+    runs-on: ubuntu-24.04
+    # Same base image as godotengine/build-containers (Dockerfile.android).
+    container: fedora:43
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, arm32, x86_64, x86_32]
+    steps:
+      - name: Install base packages
+        run: |
+          dnf -y install --setopt=install_weak_deps=False \
+            bash binutils bzip2 curl file findutils gettext git make patch pkgconfig \
+            python3-pip unzip which xz zip \
+            java-21-openjdk-devel ncurses-compat-libs
+          pip install scons==${SCONS_VERSION}
+
+      - name: Install Android SDK/NDK
+        run: |
+          mkdir -p "$ANDROID_SDK_ROOT"
+          cd "$ANDROID_SDK_ROOT"
+          curl -fLO "https://dl.google.com/android/repository/${ANDROID_CMDLINE_TOOLS}"
+          unzip -q "$ANDROID_CMDLINE_TOOLS"
+          rm -f "$ANDROID_CMDLINE_TOOLS"
+          yes | cmdline-tools/bin/sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --licenses > /dev/null
+          cmdline-tools/bin/sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
+            "ndk;${ANDROID_NDK_VERSION}" "build-tools;${ANDROID_BUILD_TOOLS}" \
+            "platforms;${ANDROID_PLATFORM}" platform-tools > /dev/null
+          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+
+      - name: Prepare patched source
+        run: |
+          git config --global --add safe.directory '*'
+          scripts/prepare-source.sh "${{ needs.check-patches.outputs.sha }}" godot
+
+      - name: Install Swappy frame pacing
+        working-directory: godot
+        run: python3 misc/scripts/install_swappy_android.py
+
+      - name: Restore SCons cache
+        uses: actions/cache@v4
+        with:
+          path: godot/.scons_cache
+          key: scons-android-${{ matrix.arch }}-${{ env.GODOT_REF }}-${{ github.run_id }}
+          restore-keys: |
+            scons-android-${{ matrix.arch }}-${{ env.GODOT_REF }}-
+
+      - name: Build
+        working-directory: godot
+        env:
+          SCONS_CACHE: ${{ github.workspace }}/godot/.scons_cache
+          TERM: xterm
+          BUILD_NAME: ${{ env.BUILD_NAME }}
+          GODOT_VERSION_STATUS: ${{ needs.check-patches.outputs.status }}
+        run: |
+          # Flags as in godot-build-scripts (4.7 branch) build-android/build.sh
+          SCONS="scons -j$(nproc) verbose=yes warnings=no progress=no redirect_build_objects=no"
+          for target in template_release template_debug; do
+            $SCONS platform=android arch=${{ matrix.arch }} production=yes swappy=yes target=$target
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-libs-${{ matrix.arch }}
+          # Gradle packages whatever ABIs are present in debug/ and release/.
+          path: godot/platform/android/java/lib/libs
+          if-no-files-found: error
+
+  android-templates:
+    name: Android templates
+    needs: [check-patches, build-android]
+    runs-on: ubuntu-24.04
+    container: fedora:43
+    steps:
+      - name: Install base packages
+        run: |
+          dnf -y install --setopt=install_weak_deps=False \
+            bash bzip2 curl file findutils git make patch python3-pip unzip which xz zip \
+            java-21-openjdk-devel ncurses-compat-libs
+          pip install scons==${SCONS_VERSION}
+
+      - name: Install Android SDK/NDK
+        run: |
+          mkdir -p "$ANDROID_SDK_ROOT"
+          cd "$ANDROID_SDK_ROOT"
+          curl -fLO "https://dl.google.com/android/repository/${ANDROID_CMDLINE_TOOLS}"
+          unzip -q "$ANDROID_CMDLINE_TOOLS"
+          rm -f "$ANDROID_CMDLINE_TOOLS"
+          yes | cmdline-tools/bin/sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --licenses > /dev/null
+          cmdline-tools/bin/sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
+            "ndk;${ANDROID_NDK_VERSION}" "build-tools;${ANDROID_BUILD_TOOLS}" \
+            "platforms;${ANDROID_PLATFORM}" platform-tools > /dev/null
+          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+
+      - name: Prepare patched source
+        run: |
+          git config --global --add safe.directory '*'
+          scripts/prepare-source.sh "${{ needs.check-patches.outputs.sha }}" godot
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: android-libs-*
+          path: androidlibs
+
+      - name: Merge native libraries
+        run: |
+          mkdir -p godot/platform/android/java/lib/libs
+          cp -r androidlibs/android-libs-*/debug androidlibs/android-libs-*/release \
+            godot/platform/android/java/lib/libs/
+          find godot/platform/android/java/lib/libs -name '*.so' | sort
+
+      - name: Generate templates
+        working-directory: godot/platform/android/java
+        run: ./gradlew --no-daemon generateGodotTemplates
+
+      - name: Collect output
+        run: |
+          mkdir -p out
+          cp godot/bin/android_debug.apk godot/bin/android_release.apk godot/bin/android_source.zip out/
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-templates
+          path: out/*
+          if-no-files-found: error
+
   package:
     name: Package
-    needs: [check-patches, build]
+    needs: [check-patches, build, android-templates]
     runs-on: ubuntu-24.04
     env:
       # Template version (version.txt): major.minor.patch.status, no build name
@@ -191,6 +332,9 @@ jobs:
             cp $src.exe         tpz/templates/windows_${t}_x86_64.exe
             cp $src.console.exe tpz/templates/windows_${t}_x86_64_console.exe
           done
+          cp $a/android-templates/android_debug.apk \
+             $a/android-templates/android_release.apk \
+             $a/android-templates/android_source.zip tpz/templates/
           (cd tpz && zip -q -9 -r -D "../dist/${BASENAME}_export_templates.zip" templates/*)
 
           # Editors
