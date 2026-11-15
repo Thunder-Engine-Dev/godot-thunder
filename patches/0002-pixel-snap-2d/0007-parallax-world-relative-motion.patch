@@ -1,0 +1,332 @@
+diff --git a/scene/2d/parallax_2d.cpp b/scene/2d/parallax_2d.cpp
+index 89de18a7fe..07fcf55263 100644
+--- a/scene/2d/parallax_2d.cpp
++++ b/scene/2d/parallax_2d.cpp
+@@ -33,6 +33,7 @@
+ #include "core/config/engine.h"
+ #include "core/object/class_db.h"
+ #include "scene/main/viewport.h"
++#include "servers/rendering/renderer_snap_2d.h"
+ #include "servers/rendering/rendering_server.h"
+ 
+ void Parallax2D::_notification(int p_what) {
+@@ -41,6 +42,7 @@ void Parallax2D::_notification(int p_what) {
+ 			group_name = "__cameras_" + itos(get_viewport_rid().get_id());
+ 			add_to_group(group_name);
+ 			_update_repeat();
++			_update_snap_world_motion();
+ 			_update_scroll();
+ 		} break;
+ 
+@@ -102,6 +104,19 @@ void Parallax2D::_update_process() {
+ 	set_process_internal(!Engine::get_singleton()->is_editor_hint() && (repeat_size.x || repeat_size.y) && (autoscroll.x || autoscroll.y));
+ }
+ 
++void Parallax2D::_update_snap_world_motion() {
++	// The layer shifts relative to the game world by (1 - scroll_scale) of the camera movement, plus
++	// autoscroll. That can be tiny on a slow camera, so it must not be detected from the transform
++	// delta: switching between GPU and canvas snap steps the layer back when the camera stops.
++	// A layer with scroll_scale 1 does not move relative to the world, which the delta shows correctly.
++	const bool autoscrolls = repeat_size.x || repeat_size.y;
++	const bool scrolling_x = scroll_scale.x != 1 || (autoscrolls && autoscroll.x != 0);
++	const bool scrolling_y = scroll_scale.y != 1 || (autoscrolls && autoscroll.y != 0);
++	RenderingServer::get_singleton()->canvas_item_set_snap_2d_world_motion(get_canvas_item(),
++			scrolling_x ? RendererSnap2D::WORLD_MOTION_SCROLLING : RendererSnap2D::WORLD_MOTION_AUTO,
++			scrolling_y ? RendererSnap2D::WORLD_MOTION_SCROLLING : RendererSnap2D::WORLD_MOTION_AUTO);
++}
++
+ void Parallax2D::_update_scroll() {
+ 	if (!is_inside_tree()) {
+ 		return;
+@@ -154,6 +169,7 @@ void Parallax2D::_update_repeat() {
+ 
+ void Parallax2D::set_scroll_scale(const Size2 &p_scale) {
+ 	scroll_scale = p_scale;
++	_update_snap_world_motion();
+ }
+ 
+ Size2 Parallax2D::get_scroll_scale() const {
+@@ -168,6 +184,7 @@ void Parallax2D::set_repeat_size(const Size2 &p_repeat_size) {
+ 	repeat_size = p_repeat_size.maxf(0);
+ 
+ 	_update_process();
++	_update_snap_world_motion();
+ 	_update_repeat();
+ 	_update_scroll();
+ }
+@@ -212,6 +229,7 @@ void Parallax2D::set_autoscroll(const Point2 &p_autoscroll) {
+ 	autoscroll = p_autoscroll;
+ 
+ 	_update_process();
++	_update_snap_world_motion();
+ 	_update_scroll();
+ }
+ 
+diff --git a/scene/2d/parallax_2d.h b/scene/2d/parallax_2d.h
+index 0903d4ef1f..6bcd4c9b35 100644
+--- a/scene/2d/parallax_2d.h
++++ b/scene/2d/parallax_2d.h
+@@ -50,6 +50,7 @@ class Parallax2D : public Node2D {
+ 	bool ignore_camera_scroll = false;
+ 
+ 	void _update_process();
++	void _update_snap_world_motion();
+ 	void _update_repeat();
+ 	void _update_scroll();
+ 
+diff --git a/scene/2d/parallax_layer.cpp b/scene/2d/parallax_layer.cpp
+index 0b52b1c9cc..4919d2a05d 100644
+--- a/scene/2d/parallax_layer.cpp
++++ b/scene/2d/parallax_layer.cpp
+@@ -33,6 +33,7 @@
+ #include "core/config/engine.h"
+ #include "core/object/class_db.h"
+ #include "scene/2d/parallax_background.h"
++#include "servers/rendering/renderer_snap_2d.h"
+ #include "servers/rendering/rendering_server.h"
+ 
+ void ParallaxLayer::set_motion_scale(const Size2 &p_scale) {
+@@ -109,6 +110,32 @@ void ParallaxLayer::_notification(int p_what) {
+ 	}
+ }
+ 
++void ParallaxLayer::_update_snap_world_motion(const Point2 &p_base_scale) {
++	// The layer lives in the canvas of its ParallaxBackground, which does not include the camera,
++	// so its transform delta is relative to the viewport. What matters for snapping is movement
++	// relative to the game world: a layer scrolling at exactly the camera speed (effective motion
++	// scale 1) is fixed to the world and must snap like static items, any other scale always moves.
++	const Vector2 scale = motion_scale * p_base_scale;
++	uint8_t motion_x = RendererSnap2D::WORLD_MOTION_AUTO;
++	uint8_t motion_y = RendererSnap2D::WORLD_MOTION_AUTO;
++	if (scale.x != 1) {
++		motion_x = RendererSnap2D::WORLD_MOTION_SCROLLING;
++	} else if (motion_offset.x == 0) {
++		motion_x = RendererSnap2D::WORLD_MOTION_STATIC;
++	}
++	if (scale.y != 1) {
++		motion_y = RendererSnap2D::WORLD_MOTION_SCROLLING;
++	} else if (motion_offset.y == 0) {
++		motion_y = RendererSnap2D::WORLD_MOTION_STATIC;
++	}
++	if (motion_x == snap_world_motion_x && motion_y == snap_world_motion_y) {
++		return;
++	}
++	snap_world_motion_x = motion_x;
++	snap_world_motion_y = motion_y;
++	RenderingServer::get_singleton()->canvas_item_set_snap_2d_world_motion(get_canvas_item(), motion_x, motion_y);
++}
++
+ void ParallaxLayer::set_base_offset_and_scale(const Point2 &p_offset, real_t p_scale) {
+ 	if (!is_inside_tree()) {
+ 		return;
+@@ -117,6 +144,9 @@ void ParallaxLayer::set_base_offset_and_scale(const Point2 &p_offset, real_t p_s
+ 		return;
+ 	}
+ 
++	ParallaxBackground *pb = Object::cast_to<ParallaxBackground>(get_parent());
++	_update_snap_world_motion(pb ? pb->get_scroll_base_scale() : Point2(1, 1));
++
+ 	Point2 new_ofs = p_offset * motion_scale + motion_offset * p_scale + orig_offset * p_scale;
+ 
+ 	if (mirroring.x) {
+diff --git a/scene/2d/parallax_layer.h b/scene/2d/parallax_layer.h
+index 22ea5ad6b5..84b85aadb6 100644
+--- a/scene/2d/parallax_layer.h
++++ b/scene/2d/parallax_layer.h
+@@ -41,6 +41,9 @@ class ParallaxLayer : public Node2D {
+ 	Vector2 motion_offset;
+ 	Vector2 mirroring;
+ 	void _update_mirroring();
++	void _update_snap_world_motion(const Point2 &p_base_scale);
++	uint8_t snap_world_motion_x = 0;
++	uint8_t snap_world_motion_y = 0;
+ 
+ protected:
+ 	void _notification(int p_what);
+diff --git a/servers/rendering/renderer_canvas_cull.cpp b/servers/rendering/renderer_canvas_cull.cpp
+index 2245f67345..cfd73d7af9 100644
+--- a/servers/rendering/renderer_canvas_cull.cpp
++++ b/servers/rendering/renderer_canvas_cull.cpp
+@@ -238,6 +238,19 @@ void RendererCanvasCull::_detect_screen_transform_snap_axes(Item *p_item, const
+ 		r_moving_y = true;
+ 	}
+ 
++	// Motion relative to the world known from the node overrides the delta. Such an axis never
++	// switches between GPU and canvas snap, so there is nothing to step back when it stops.
++	const bool forced_x = _snap_world_motion_x != RendererSnap2D::WORLD_MOTION_AUTO;
++	const bool forced_y = _snap_world_motion_y != RendererSnap2D::WORLD_MOTION_AUTO;
++	if (forced_x) {
++		r_moving_x = _snap_world_motion_x == RendererSnap2D::WORLD_MOTION_SCROLLING;
++		p_item->screen_transform_snap_hold_x = 0;
++	}
++	if (forced_y) {
++		r_moving_y = _snap_world_motion_y == RendererSnap2D::WORLD_MOTION_SCROLLING;
++		p_item->screen_transform_snap_hold_y = 0;
++	}
++
+ 	// Switching between GPU and canvas snap changes the rendered pixel whenever the two roundings
+ 	// disagree (e.g. a platform creeping to a stop or starting to move again). Prefer switching on a
+ 	// frame where both give the same pixel, but wait only a few frames so that an item that really
+@@ -246,13 +259,13 @@ void RendererCanvasCull::_detect_screen_transform_snap_axes(Item *p_item, const
+ 	const real_t settled_epsilon = RendererSnap2D::SCREEN_TRANSFORM_SNAP_SETTLED_EPSILON;
+ 	const bool wait_x_unbounded = Math::abs(delta.x) >= settled_epsilon;
+ 	const bool wait_y_unbounded = Math::abs(delta.y) >= settled_epsilon;
+-	if (r_moving_x != p_item->screen_transform_snap_x && Math::floor(p_canvas_origin.x + 0.5) != Math::floor(p_gpu_origin.x + 0.5 + bias) && (wait_x_unbounded || p_item->screen_transform_snap_wait_x < RendererSnap2D::SCREEN_TRANSFORM_SNAP_SWITCH_MAX_WAIT_FRAMES)) {
++	if (!forced_x && r_moving_x != p_item->screen_transform_snap_x && Math::floor(p_canvas_origin.x + 0.5) != Math::floor(p_gpu_origin.x + 0.5 + bias) && (wait_x_unbounded || p_item->screen_transform_snap_wait_x < RendererSnap2D::SCREEN_TRANSFORM_SNAP_SWITCH_MAX_WAIT_FRAMES)) {
+ 		p_item->screen_transform_snap_wait_x++;
+ 		r_moving_x = p_item->screen_transform_snap_x;
+ 	} else {
+ 		p_item->screen_transform_snap_wait_x = 0;
+ 	}
+-	if (r_moving_y != p_item->screen_transform_snap_y && Math::floor(p_canvas_origin.y + 0.5) != Math::floor(p_gpu_origin.y + 0.5 + bias) && (wait_y_unbounded || p_item->screen_transform_snap_wait_y < RendererSnap2D::SCREEN_TRANSFORM_SNAP_SWITCH_MAX_WAIT_FRAMES)) {
++	if (!forced_y && r_moving_y != p_item->screen_transform_snap_y && Math::floor(p_canvas_origin.y + 0.5) != Math::floor(p_gpu_origin.y + 0.5 + bias) && (wait_y_unbounded || p_item->screen_transform_snap_wait_y < RendererSnap2D::SCREEN_TRANSFORM_SNAP_SWITCH_MAX_WAIT_FRAMES)) {
+ 		p_item->screen_transform_snap_wait_y++;
+ 		r_moving_y = p_item->screen_transform_snap_y;
+ 	} else {
+@@ -531,6 +544,27 @@ void RendererCanvasCull::_cull_canvas_item(Item *p_canvas_item, const Transform2
+ 	ci->use_canvas_transform_snap = uses_canvas_transform_snap;
+ 	ci->skip_screen_transform_snap = uses_canvas_transform_snap && _viewport_uses_screen_transform_snap;
+ 
++	// An item that knows how it moves relative to the world passes that to its descendants.
++	struct WorldMotionScope {
++		uint8_t &x;
++		uint8_t &y;
++		uint8_t prev_x;
++		uint8_t prev_y;
++		WorldMotionScope(uint8_t &p_x, uint8_t &p_y, uint8_t p_item_x, uint8_t p_item_y) :
++				x(p_x), y(p_y), prev_x(p_x), prev_y(p_y) {
++			if (p_item_x != RendererSnap2D::WORLD_MOTION_AUTO) {
++				x = p_item_x;
++			}
++			if (p_item_y != RendererSnap2D::WORLD_MOTION_AUTO) {
++				y = p_item_y;
++			}
++		}
++		~WorldMotionScope() {
++			x = prev_x;
++			y = prev_y;
++		}
++	} world_motion_scope(_snap_world_motion_x, _snap_world_motion_y, ci->snap_2d_world_motion_x, ci->snap_2d_world_motion_y);
++
+ 	Rect2 rect = ci->get_rect();
+ 
+ 	if (ci->visibility_notifier) {
+@@ -774,6 +808,8 @@ void RendererCanvasCull::render_canvas(RID p_render_target, Canvas *p_canvas, co
+ 	_viewport_uses_canvas_transform_snap = RendererSnap2D::use_canvas_transform_snap(p_snap_2d_transforms_to_pixel, (RendererSnap2D::TransformSnapMethod)p_snap_2d_transforms_method);
+ 	_viewport_uses_screen_transform_snap = RendererSnap2D::use_screen_transform_snap(p_snap_2d_transforms_to_pixel, (RendererSnap2D::TransformSnapMethod)p_snap_2d_transforms_method);
+ 	_viewport_uses_screen_transform_snap_moving = RendererSnap2D::use_screen_transform_snap_moving(p_snap_2d_transforms_to_pixel, (RendererSnap2D::TransformSnapMethod)p_snap_2d_transforms_method);
++	_snap_world_motion_x = RendererSnap2D::WORLD_MOTION_AUTO;
++	_snap_world_motion_y = RendererSnap2D::WORLD_MOTION_AUTO;
+ 
+ 	if (p_canvas->children_order_dirty) {
+ 		p_canvas->child_items.sort();
+@@ -2815,6 +2851,15 @@ bool RendererCanvasCull::_item_uses_forced_screen_transform_snap(const Item *p_i
+ 	return p_parent_uses_forced_screen_transform_snap;
+ }
+ 
++void RendererCanvasCull::canvas_item_set_snap_2d_world_motion(RID p_item, int p_motion_x, int p_motion_y) {
++	ERR_FAIL_INDEX(p_motion_x, RendererSnap2D::WORLD_MOTION_SCROLLING + 1);
++	ERR_FAIL_INDEX(p_motion_y, RendererSnap2D::WORLD_MOTION_SCROLLING + 1);
++	Item *ci = canvas_item_owner.get_or_null(p_item);
++	ERR_FAIL_NULL(ci);
++	ci->snap_2d_world_motion_x = p_motion_x;
++	ci->snap_2d_world_motion_y = p_motion_y;
++}
++
+ void RendererCanvasCull::canvas_item_set_snap_2d_transforms_mode(RID p_item, int p_mode) {
+ 	ERR_FAIL_INDEX(p_mode, RendererSnap2D::SNAP_2D_TRANSFORMS_ITEM_SCREEN + 1);
+ 	Item *ci = canvas_item_owner.get_or_null(p_item);
+diff --git a/servers/rendering/renderer_canvas_cull.h b/servers/rendering/renderer_canvas_cull.h
+index ceabea21b2..cc2c55bd41 100644
+--- a/servers/rendering/renderer_canvas_cull.h
++++ b/servers/rendering/renderer_canvas_cull.h
+@@ -198,6 +198,9 @@ public:
+ 	bool _viewport_uses_canvas_transform_snap = false;
+ 	bool _viewport_uses_screen_transform_snap = false;
+ 	bool _viewport_uses_screen_transform_snap_moving = false;
++	// World motion of the item being culled, inherited from the nearest ancestor that sets it.
++	uint8_t _snap_world_motion_x = 0;
++	uint8_t _snap_world_motion_y = 0;
+ 
+ 	bool debug_redraw = false;
+ 	double debug_redraw_time = 0;
+@@ -390,6 +393,7 @@ public:
+ 	void canvas_item_set_default_texture_filter(RID p_item, RSE::CanvasItemTextureFilter p_filter);
+ 	void canvas_item_set_default_texture_repeat(RID p_item, RSE::CanvasItemTextureRepeat p_repeat);
+ 	void canvas_item_set_snap_2d_transforms_mode(RID p_item, int p_mode);
++	void canvas_item_set_snap_2d_world_motion(RID p_item, int p_motion_x, int p_motion_y);
+ 
+ 	void update_visibility_notifiers();
+ 	void update_dirty_items();
+diff --git a/servers/rendering/renderer_canvas_render.h b/servers/rendering/renderer_canvas_render.h
+index 20612b5f2c..9456b9d08a 100644
+--- a/servers/rendering/renderer_canvas_render.h
++++ b/servers/rendering/renderer_canvas_render.h
+@@ -379,6 +379,8 @@ public:
+ 		bool screen_transform_snap_y = false;
+ 		bool screen_transform_snap_world_origin_valid = false;
+ 		Point2 screen_transform_snap_world_origin_prev;
++		uint8_t snap_2d_world_motion_x = RendererSnap2D::WORLD_MOTION_AUTO;
++		uint8_t snap_2d_world_motion_y = RendererSnap2D::WORLD_MOTION_AUTO;
+ 		uint8_t screen_transform_snap_hold_x = 0;
+ 		uint8_t screen_transform_snap_hold_y = 0;
+ 		uint8_t screen_transform_snap_wait_x = 0;
+diff --git a/servers/rendering/renderer_snap_2d.h b/servers/rendering/renderer_snap_2d.h
+index c75505931a..5faf379afa 100644
+--- a/servers/rendering/renderer_snap_2d.h
++++ b/servers/rendering/renderer_snap_2d.h
+@@ -47,6 +47,18 @@ public:
+ 		SNAP_2D_TRANSFORMS_ITEM_SCREEN = 2,
+ 	};
+ 
++	// How an item moves relative to the game world on one axis, when that is known from the node
++	// (Parallax2D, ParallaxLayer) and cannot be told from its per-frame transform delta.
++	// A parallax layer shifts by a fraction of the camera movement, which can be below the
++	// detection epsilon on a slow camera, or inside a CanvasLayer be camera-induced even though the
++	// layer is fixed to the world. Detecting that from deltas flips GPU/canvas snap and the layer
++	// steps back by a pixel when the camera stops.
++	enum WorldMotion : uint8_t {
++		WORLD_MOTION_AUTO = 0, // Detect from the transform delta.
++		WORLD_MOTION_STATIC = 1, // Fixed to the world: camera-induced movement is not movement.
++		WORLD_MOTION_SCROLLING = 2, // Always shifts relative to the world: keep GPU snap.
++	};
++
+ 	static constexpr float SCREEN_TRANSFORM_SNAP_MOVING_EPSILON = 0.01f;
+ 	// CharacterBody floor resolution can oscillate ~0.017 px on the secondary axis while
+ 	// moving on the primary axis. Suppress GPU snap on such an axis when another axis dominates.
+diff --git a/servers/rendering/rendering_server.cpp b/servers/rendering/rendering_server.cpp
+index 3503ef9bb6..f47c625ef6 100644
+--- a/servers/rendering/rendering_server.cpp
++++ b/servers/rendering/rendering_server.cpp
+@@ -3318,6 +3318,7 @@ void RenderingServer::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("canvas_item_set_default_texture_filter", "item", "filter"), &RenderingServer::canvas_item_set_default_texture_filter);
+ 	ClassDB::bind_method(D_METHOD("canvas_item_set_default_texture_repeat", "item", "repeat"), &RenderingServer::canvas_item_set_default_texture_repeat);
+ 	ClassDB::bind_method(D_METHOD("canvas_item_set_snap_2d_transforms_mode", "item", "mode"), &RenderingServer::canvas_item_set_snap_2d_transforms_mode);
++	ClassDB::bind_method(D_METHOD("canvas_item_set_snap_2d_world_motion", "item", "motion_x", "motion_y"), &RenderingServer::canvas_item_set_snap_2d_world_motion);
+ 	ClassDB::bind_method(D_METHOD("canvas_item_set_visible", "item", "visible"), &RenderingServer::canvas_item_set_visible);
+ 	ClassDB::bind_method(D_METHOD("canvas_item_set_light_mask", "item", "mask"), &RenderingServer::canvas_item_set_light_mask);
+ 	ClassDB::bind_method(D_METHOD("canvas_item_set_visibility_layer", "item", "visibility_layer"), &RenderingServer::canvas_item_set_visibility_layer);
+diff --git a/servers/rendering/rendering_server.h b/servers/rendering/rendering_server.h
+index d93ce3188a..3ab8baa365 100644
+--- a/servers/rendering/rendering_server.h
++++ b/servers/rendering/rendering_server.h
+@@ -803,6 +803,7 @@ public:
+ 	virtual void canvas_item_set_default_texture_filter(RID p_item, RSE::CanvasItemTextureFilter p_filter) = 0;
+ 	virtual void canvas_item_set_default_texture_repeat(RID p_item, RSE::CanvasItemTextureRepeat p_repeat) = 0;
+ 	virtual void canvas_item_set_snap_2d_transforms_mode(RID p_item, int p_mode) = 0;
++	virtual void canvas_item_set_snap_2d_world_motion(RID p_item, int p_motion_x, int p_motion_y) = 0;
+ 
+ 	virtual void canvas_item_set_visible(RID p_item, bool p_visible) = 0;
+ 	virtual void canvas_item_set_light_mask(RID p_item, int p_mask) = 0;
+diff --git a/servers/rendering/rendering_server_default.h b/servers/rendering/rendering_server_default.h
+index 162be8771c..c40b23165a 100644
+--- a/servers/rendering/rendering_server_default.h
++++ b/servers/rendering/rendering_server_default.h
+@@ -1008,6 +1008,7 @@ public:
+ 	FUNC2(canvas_item_set_default_texture_filter, RID, RSE::CanvasItemTextureFilter)
+ 	FUNC2(canvas_item_set_default_texture_repeat, RID, RSE::CanvasItemTextureRepeat)
+ 	FUNC2(canvas_item_set_snap_2d_transforms_mode, RID, int)
++	FUNC3(canvas_item_set_snap_2d_world_motion, RID, int, int)
+ 
+ 	FUNC2(canvas_item_set_visible, RID, bool)
+ 	FUNC2(canvas_item_set_light_mask, RID, int)
