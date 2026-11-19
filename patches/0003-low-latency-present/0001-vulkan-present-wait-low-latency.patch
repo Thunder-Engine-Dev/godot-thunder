@@ -1,0 +1,369 @@
+diff --git a/core/config/project_settings.cpp b/core/config/project_settings.cpp
+index 0e078c3..247c9d3 100644
+--- a/core/config/project_settings.cpp
++++ b/core/config/project_settings.cpp
+@@ -1822,6 +1822,7 @@ ProjectSettings::ProjectSettings() {
+ 
+ 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/rendering_device/vsync/frame_queue_size", PROPERTY_HINT_RANGE, "2,3,1"), 2);
+ 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/rendering_device/vsync/swapchain_image_count", PROPERTY_HINT_RANGE, "2,4,1"), 3);
++	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/rendering_device/vsync/low_latency", PROPERTY_HINT_ENUM, "Off,Wait For Presentation,Adaptive"), 2);
+ 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/rendering_device/staging_buffer/block_size_kb", PROPERTY_HINT_RANGE, "4,2048,1,or_greater"), 256);
+ 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/rendering_device/staging_buffer/max_size_mb", PROPERTY_HINT_RANGE, "1,1024,1,or_greater"), 128);
+ 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/rendering_device/staging_buffer/texture_upload_region_size_px", PROPERTY_HINT_RANGE, "1,256,1,or_greater"), 64);
+diff --git a/doc/classes/ProjectSettings.xml b/doc/classes/ProjectSettings.xml
+index f70c698..283d7a2 100644
+--- a/doc/classes/ProjectSettings.xml
++++ b/doc/classes/ProjectSettings.xml
+@@ -3398,6 +3398,13 @@
+ 			Try the [url=https://darksylinc.github.io/vsync_simulator/]V-Sync Simulator[/url], an interactive interface that simulates presentation to better understand how it is affected by different variables under various conditions.
+ 			[b]Note:[/b] This property is only read when the project starts. There is currently no way to change this value at run-time.
+ 		</member>
++		<member name="rendering/rendering_device/vsync/low_latency" type="int" setter="" getter="" default="2">
++			Reduces input latency while V-Sync is enabled, on drivers that report when a frame reaches the screen (Vulkan with [code]VK_KHR_present_wait[/code]). Has no effect otherwise.
++			[b]Off[/b] keeps the default behavior, where the engine reads input and then may stall for up to a full refresh waiting for a free swapchain image.
++			[b]Wait For Presentation[/b] waits until the previous frame is on screen before reading input.
++			[b]Adaptive[/b] additionally delays the start of each frame so that input is read as late as possible while the frame is still finished before the next refresh. The delay adapts automatically to the system.
++			The environment variable [code]GODOT_LOW_LATENCY[/code] (0, 1 or 2) overrides this setting, for example [code]GODOT_LOW_LATENCY=0[/code] turns the feature off.
++		</member>
+ 		<member name="rendering/rendering_device/vsync/swapchain_image_count" type="int" setter="" getter="" default="3">
+ 			The number of images the swapchain will consist of (back buffers + front buffer).
+ 			[code]2[/code] corresponds to double-buffering and [code]3[/code] to triple-buffering.
+diff --git a/drivers/vulkan/rendering_device_driver_vulkan.cpp b/drivers/vulkan/rendering_device_driver_vulkan.cpp
+index 9f41dbf..71e3f02 100644
+--- a/drivers/vulkan/rendering_device_driver_vulkan.cpp
++++ b/drivers/vulkan/rendering_device_driver_vulkan.cpp
+@@ -563,6 +563,8 @@ Error RenderingDeviceDriverVulkan::_initialize_device_extensions() {
+ 	enabled_device_extension_names.clear();
+ 
+ 	_register_requested_device_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME, true);
++	_register_requested_device_extension(VK_KHR_PRESENT_ID_EXTENSION_NAME, false);
++	_register_requested_device_extension(VK_KHR_PRESENT_WAIT_EXTENSION_NAME, false);
+ 	_register_requested_device_extension(VK_KHR_MULTIVIEW_EXTENSION_NAME, false);
+ 	_register_requested_device_extension(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME, false);
+ 	_register_requested_device_extension(VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME, false);
+@@ -1453,6 +1455,19 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
+ 		create_info_next = &raytracing_validation_features;
+ 	}
+ 
++	VkPhysicalDevicePresentIdFeaturesKHR present_id_features = {};
++	VkPhysicalDevicePresentWaitFeaturesKHR present_wait_features = {};
++	if (enabled_device_extension_names.has(VK_KHR_PRESENT_ID_EXTENSION_NAME) && enabled_device_extension_names.has(VK_KHR_PRESENT_WAIT_EXTENSION_NAME)) {
++		present_id_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR;
++		present_id_features.pNext = create_info_next;
++		present_id_features.presentId = VK_TRUE;
++		create_info_next = &present_id_features;
++		present_wait_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR;
++		present_wait_features.pNext = create_info_next;
++		present_wait_features.presentWait = VK_TRUE;
++		create_info_next = &present_wait_features;
++	}
++
+ 	VkPhysicalDeviceRayQueryFeaturesKHR ray_query_features = {};
+ 	if (ray_query_support) {
+ 		ray_query_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+@@ -1533,6 +1548,10 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
+ 		device_functions.GetSwapchainImagesKHR = PFN_vkGetSwapchainImagesKHR(functions.GetDeviceProcAddr(vk_device, "vkGetSwapchainImagesKHR"));
+ 		device_functions.AcquireNextImageKHR = PFN_vkAcquireNextImageKHR(functions.GetDeviceProcAddr(vk_device, "vkAcquireNextImageKHR"));
+ 		device_functions.QueuePresentKHR = PFN_vkQueuePresentKHR(functions.GetDeviceProcAddr(vk_device, "vkQueuePresentKHR"));
++		if (enabled_device_extension_names.has(VK_KHR_PRESENT_ID_EXTENSION_NAME) && enabled_device_extension_names.has(VK_KHR_PRESENT_WAIT_EXTENSION_NAME)) {
++			device_functions.WaitForPresentKHR = PFN_vkWaitForPresentKHR(functions.GetDeviceProcAddr(vk_device, "vkWaitForPresentKHR"));
++			present_wait_enabled = device_functions.WaitForPresentKHR != nullptr;
++		}
+ 
+ 		if (enabled_device_extension_names.has(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME)) {
+ 			device_functions.CreateRenderPass2KHR = PFN_vkCreateRenderPass2KHR(functions.GetDeviceProcAddr(vk_device, "vkCreateRenderPass2KHR"));
+@@ -3331,6 +3350,19 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
+ 		present_info.pImageIndices = image_indices.ptr();
+ 		present_info.pResults = results.ptr();
+ 
++		thread_local LocalVector<uint64_t> present_ids;
++		VkPresentIdKHR present_id_info = {};
++		if (present_wait_enabled) {
++			present_ids.clear();
++			for (uint32_t i = 0; i < p_swap_chains.size(); i++) {
++				present_ids.push_back(++((SwapChain *)(p_swap_chains[i].id))->present_id);
++			}
++			present_id_info.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR;
++			present_id_info.swapchainCount = present_ids.size();
++			present_id_info.pPresentIds = present_ids.ptr();
++			present_info.pNext = &present_id_info;
++		}
++
+ 		device_queue.submit_mutex.lock();
+ #if defined(SWAPPY_FRAME_PACING_ENABLED)
+ 		if (swappy_frame_pacer_enable) {
+@@ -3382,6 +3414,18 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
+ 	return OK;
+ }
+ 
++bool RenderingDeviceDriverVulkan::swap_chain_wait_for_present(SwapChainID p_swap_chain, uint32_t p_frames_back, uint64_t p_timeout_ns) {
++	if (!present_wait_enabled || p_swap_chain.id == 0) {
++		return false;
++	}
++	SwapChain *swap_chain = (SwapChain *)(p_swap_chain.id);
++	if (swap_chain->vk_swapchain == VK_NULL_HANDLE || swap_chain->present_id <= p_frames_back) {
++		return false;
++	}
++	VkResult err = device_functions.WaitForPresentKHR(vk_device, swap_chain->vk_swapchain, swap_chain->present_id - p_frames_back, p_timeout_ns);
++	return err == VK_SUCCESS;
++}
++
+ void RenderingDeviceDriverVulkan::command_queue_free(CommandQueueID p_cmd_queue) {
+ 	DEV_ASSERT(p_cmd_queue);
+ 
+@@ -3862,6 +3906,7 @@ Error RenderingDeviceDriverVulkan::swap_chain_resize(CommandQueueID p_cmd_queue,
+ 	swap_create_info.compositeAlpha = composite_alpha;
+ 	swap_create_info.presentMode = present_mode;
+ 	swap_create_info.clipped = true;
++	swap_chain->present_id = 0;
+ 	err = device_functions.CreateSwapchainKHR(vk_device, &swap_create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SWAPCHAIN_KHR), &swap_chain->vk_swapchain);
+ 	ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, ERR_CANT_CREATE, vformat("Couldn't create Vulkan swapchain (VkResult error %d).", err));
+ 
+diff --git a/drivers/vulkan/rendering_device_driver_vulkan.h b/drivers/vulkan/rendering_device_driver_vulkan.h
+index 6d17386..b4283fb 100644
+--- a/drivers/vulkan/rendering_device_driver_vulkan.h
++++ b/drivers/vulkan/rendering_device_driver_vulkan.h
+@@ -115,6 +115,7 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
+ 		PFN_vkGetSwapchainImagesKHR GetSwapchainImagesKHR = nullptr;
+ 		PFN_vkAcquireNextImageKHR AcquireNextImageKHR = nullptr;
+ 		PFN_vkQueuePresentKHR QueuePresentKHR = nullptr;
++		PFN_vkWaitForPresentKHR WaitForPresentKHR = nullptr;
+ 		PFN_vkCreateRenderPass2KHR CreateRenderPass2KHR = nullptr;
+ 		PFN_vkCmdEndRenderPass2KHR EndRenderPass2KHR = nullptr;
+ 
+@@ -437,6 +438,7 @@ private:
+ 		RenderPassID render_pass;
+ 		int pre_transform_rotation_degrees = 0;
+ 		uint32_t image_index = 0;
++		uint64_t present_id = 0;
+ #ifdef ANDROID_ENABLED
+ 		uint64_t refresh_duration = 0;
+ #endif
+@@ -456,6 +458,8 @@ public:
+ 	virtual bool swap_chain_get_hdr_output_supported(SwapChainID p_swap_chain) override final;
+ 	virtual void swap_chain_set_max_fps(SwapChainID p_swap_chain, int p_max_fps) override final;
+ 	virtual void swap_chain_free(SwapChainID p_swap_chain) override final;
++	virtual bool swap_chain_wait_for_present(SwapChainID p_swap_chain, uint32_t p_frames_back, uint64_t p_timeout_ns) override final;
++	bool present_wait_enabled = false;
+ 
+ private:
+ 	/*********************/
+diff --git a/main/main.cpp b/main/main.cpp
+index 2fc62fd..b494a32 100644
+--- a/main/main.cpp
++++ b/main/main.cpp
+@@ -4919,6 +4919,9 @@ static uint64_t navigation_process_max = 0;
+ // will terminate the program. In case of failure, the OS exit code needs
+ // to be set explicitly here (defaults to EXIT_SUCCESS).
+ bool Main::iteration() {
++	if (RenderingDevice *rd_pace = RenderingDevice::get_singleton()) {
++		rd_pace->pace_frame_begin();
++	}
+ 	GodotProfileZone("Main::iteration");
+ 	GodotProfileZoneGroupedFirst(_profile_zone, "prepare");
+ 	iterating++;
+diff --git a/servers/rendering/rendering_device.cpp b/servers/rendering/rendering_device.cpp
+index 861a790..e23f6db 100644
+--- a/servers/rendering/rendering_device.cpp
++++ b/servers/rendering/rendering_device.cpp
+@@ -39,6 +39,7 @@
+ #include "core/os/os.h"
+ #include "core/profiling/profiling.h"
+ #include "core/templates/fixed_vector.h"
++#include "servers/display/display_server.h"
+ #include "servers/rendering/rendering_device_binds.h"
+ #include "servers/rendering/rendering_shader_container.h"
+ #include "servers/rendering/shader_include_db.h"
+@@ -7866,6 +7867,104 @@ RenderingDevice::DriverWorkarounds RenderingDevice::get_driver_workarounds() con
+ 	return driver->get_driver_workarounds();
+ }
+ 
++void RenderingDevice::_pace_note_present() {
++	if (pacing.mode >= 2 && pacing.t_start != 0) {
++		pacing.cost_ring[pacing.cost_idx++ % FramePacing::COST_SAMPLES] = OS::get_singleton()->get_ticks_usec() - pacing.t_start;
++	}
++}
++
++void RenderingDevice::pace_frame_begin() {
++	OS *os = OS::get_singleton();
++	if (pacing.mode < 0) {
++		pacing.mode = RenderingDeviceDriver::get_low_latency_mode();
++		const String env_margin = os->get_environment("GODOT_LOW_LATENCY_MARGIN_US");
++		if (!env_margin.is_empty()) {
++			pacing.margin_us = env_margin.to_int();
++		}
++		pacing.stats = !os->get_environment("GODOT_LOW_LATENCY_STATS").is_empty();
++		pacing.margin_us = CLAMP(pacing.margin_us, int64_t(300), int64_t(15000));
++	}
++	if (pacing.mode == 0 || !is_main_instance || DisplayServer::get_singleton() == nullptr) {
++		return;
++	}
++	// Only meaningful when presentation is tied to the display refresh.
++	const DisplayServerEnums::VSyncMode vsync = DisplayServer::get_singleton()->window_get_vsync_mode(DisplayServerEnums::MAIN_WINDOW_ID);
++	if (vsync != DisplayServerEnums::VSYNC_ENABLED && vsync != DisplayServerEnums::VSYNC_ADAPTIVE) {
++		pacing.t_vblank = 0;
++		return;
++	}
++	if (pacing.backoff > 0) {
++		// The driver could not tell us when a frame was shown (unsupported, minimized, occluded...).
++		pacing.backoff--;
++		pacing.t_vblank = 0;
++		return;
++	}
++	HashMap<DisplayServerEnums::WindowID, RDD::SwapChainID>::Iterator it = screen_swap_chains.find(DisplayServerEnums::MAIN_WINDOW_ID);
++	if (!it) {
++		return;
++	}
++
++	const float refresh = DisplayServer::get_singleton()->screen_get_refresh_rate(DisplayServerEnums::SCREEN_OF_MAIN_WINDOW);
++	const double nominal = refresh > 10.0f ? 1000000.0 / refresh : 0.0;
++
++	// Block until the previous frame is on screen, so that input is sampled right after a refresh
++	// instead of before an unpredictable stall inside the next frame.
++	const uint64_t wait_timeout_ns = nominal > 0.0 ? uint64_t(nominal * 3000.0) : 50000000ULL;
++	const bool waited = driver->swap_chain_wait_for_present(it->value, 0, wait_timeout_ns);
++	const uint64_t t1 = os->get_ticks_usec();
++	if (!waited) {
++		pacing.backoff = 60;
++		pacing.t_vblank = 0;
++		pacing.t_start = t1;
++		return;
++	}
++
++	if (pacing.t_vblank != 0 && nominal > 0.0) {
++		const double dt = double(t1 - pacing.t_vblank);
++		pacing.total++;
++		if (dt > nominal * 1.5) {
++			// The last frame needed an extra refresh: start earlier from now on.
++			pacing.missed++;
++			pacing.dyn_margin_us = MIN(pacing.dyn_margin_us + 1000, int64_t(nominal) - 500);
++			pacing.ok_streak = 0;
++		} else if (++pacing.ok_streak >= 90) {
++			// Many frames in a row were on time: try starting a little later.
++			pacing.dyn_margin_us = MAX(pacing.dyn_margin_us - 250, int64_t(300));
++			pacing.ok_streak = 0;
++		}
++		if (dt > nominal * 0.8 && dt < nominal * 1.2) {
++			pacing.period_us = pacing.period_us == 0.0 ? dt : (pacing.period_us * 0.98 + dt * 0.02);
++		}
++	}
++	pacing.t_vblank = t1;
++
++	uint64_t slept = 0;
++	if (pacing.mode >= 2 && pacing.period_us > 0.0) {
++		uint64_t cost = 0;
++		for (uint32_t i = 0; i < FramePacing::COST_SAMPLES; i++) {
++			cost = MAX(cost, pacing.cost_ring[i]);
++		}
++		// Start the frame as late as possible while still finishing before the next refresh.
++		const int64_t target = int64_t(t1) + int64_t(pacing.period_us) - int64_t(cost) - pacing.dyn_margin_us;
++		const int64_t now = int64_t(os->get_ticks_usec());
++		if (cost > 0 && target > now && target - now < int64_t(pacing.period_us)) {
++			const int64_t coarse = target - now - 300;
++			if (coarse > 0) {
++				os->delay_usec(coarse);
++			}
++			while (int64_t(os->get_ticks_usec()) < target) {
++			}
++			slept = os->get_ticks_usec() - t1;
++			DisplayServer::get_singleton()->process_events(); // Pick up whatever arrived while sleeping.
++		}
++	}
++	pacing.t_start = os->get_ticks_usec();
++
++	if (pacing.stats && (++pacing.counter % 180) == 0) {
++		print_line(vformat("LowLatency: mode %d, margin %d us, missed %d/%d, period %.0f us, slept %d us", pacing.mode, (int64_t)pacing.dyn_margin_us, (int64_t)pacing.missed, (int64_t)pacing.total, pacing.period_us, (int64_t)slept));
++	}
++}
++
+ void RenderingDevice::swap_buffers(bool p_present) {
+ 	ERR_RENDER_THREAD_GUARD();
+ 
+@@ -7874,6 +7973,7 @@ void RenderingDevice::swap_buffers(bool p_present) {
+ 
+ 	GodotProfileZoneGrouped(_profile_zone, "_execute_frame");
+ 	_execute_frame(p_present);
++	_pace_note_present();
+ 
+ 	// Advance to the next frame and begin recording again.
+ 	frame = (frame + 1) % frames.size();
+diff --git a/servers/rendering/rendering_device.h b/servers/rendering/rendering_device.h
+index 38c4b14..213deb2 100644
+--- a/servers/rendering/rendering_device.h
++++ b/servers/rendering/rendering_device.h
+@@ -1300,6 +1300,25 @@ private:
+ 	/**** SCREEN ****/
+ 	/****************/
+ 	HashMap<DisplayServerEnums::WindowID, RDD::SwapChainID> screen_swap_chains;
++
++	struct FramePacing {
++		static constexpr uint32_t COST_SAMPLES = 32;
++		int mode = -1; // -1 = not initialised, 0 = off, 1 = wait for the last present, 2 = wait and start the frame late.
++		int64_t margin_us = 6000; // Initial safety margin of the late start.
++		int64_t dyn_margin_us = 6000;
++		bool stats = false;
++		uint64_t t_start = 0; // Start of the work of the current frame.
++		uint64_t t_vblank = 0; // When the last present wait returned.
++		double period_us = 0.0;
++		uint64_t cost_ring[COST_SAMPLES] = {};
++		uint32_t cost_idx = 0;
++		uint32_t ok_streak = 0;
++		uint32_t backoff = 0;
++		uint64_t counter = 0;
++		uint64_t missed = 0;
++		uint64_t total = 0;
++	} pacing;
++	void _pace_note_present();
+ 	HashMap<DisplayServerEnums::WindowID, RDD::FramebufferID> screen_framebuffers;
+ 
+ 	uint32_t _get_swap_chain_desired_count() const;
+@@ -1919,6 +1938,8 @@ public:
+ 	uint64_t limit_get(Limit p_limit) const;
+ 
+ 	void swap_buffers(bool p_present);
++	// Frame pacing: call at the very beginning of a main loop iteration, before input is sampled.
++	void pace_frame_begin();
+ 
+ 	uint32_t get_frame_delay() const;
+ 
+diff --git a/servers/rendering/rendering_device_driver.cpp b/servers/rendering/rendering_device_driver.cpp
+index abc57e4..b8e75ec 100644
+--- a/servers/rendering/rendering_device_driver.cpp
++++ b/servers/rendering/rendering_device_driver.cpp
+@@ -30,6 +30,9 @@
+ 
+ #include "rendering_device_driver.h"
+ 
++#include "core/config/project_settings.h"
++#include "core/os/os.h"
++
+ /**************/
+ /**** MISC ****/
+ /**************/
+@@ -63,3 +66,11 @@ uint64_t RenderingDeviceDriver::api_trait_get(ApiTrait p_trait) {
+ /******************/
+ 
+ RenderingDeviceDriver::~RenderingDeviceDriver() {}
++
++int RenderingDeviceDriver::get_low_latency_mode() {
++	const String env_mode = OS::get_singleton()->get_environment("GODOT_LOW_LATENCY");
++	if (!env_mode.is_empty()) {
++		return CLAMP(env_mode.to_int(), 0, 2);
++	}
++	return CLAMP(int(GLOBAL_GET("rendering/rendering_device/vsync/low_latency")), 0, 2);
++}
+diff --git a/servers/rendering/rendering_device_driver.h b/servers/rendering/rendering_device_driver.h
+index 103bd99..486486d 100644
+--- a/servers/rendering/rendering_device_driver.h
++++ b/servers/rendering/rendering_device_driver.h
+@@ -493,6 +493,10 @@ public:
+ 
+ 	// Wait until all rendering associated to the swap chain is finished before deleting it.
+ 	virtual void swap_chain_free(SwapChainID p_swap_chain) = 0;
++	// 0 = off, 1 = wait for presentation, 2 = adaptive. From the project setting, overridable with the GODOT_LOW_LATENCY environment variable (GODOT_LOW_LATENCY=0 turns it off).
++	static int get_low_latency_mode();
++	// Blocks until the present issued p_frames_back presents ago has reached the screen. Returns false if unsupported or timed out.
++	virtual bool swap_chain_wait_for_present(SwapChainID p_swap_chain, uint32_t p_frames_back, uint64_t p_timeout_ns) { return false; }
+ 
+ 	/*********************/
+ 	/**** FRAMEBUFFER ****/

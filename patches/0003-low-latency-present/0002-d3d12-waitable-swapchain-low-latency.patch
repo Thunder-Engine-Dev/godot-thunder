@@ -1,0 +1,102 @@
+diff --git a/drivers/d3d12/rendering_device_driver_d3d12.cpp b/drivers/d3d12/rendering_device_driver_d3d12.cpp
+index c63a795..a5bedc5 100644
+--- a/drivers/d3d12/rendering_device_driver_d3d12.cpp
++++ b/drivers/d3d12/rendering_device_driver_d3d12.cpp
+@@ -2504,6 +2504,9 @@ Error RenderingDeviceDriverD3D12::command_queue_execute_and_present(CommandQueue
+ 	for (uint32_t i = 0; i < p_swap_chains.size(); i++) {
+ 		SwapChain *swap_chain = (SwapChain *)(p_swap_chains[i].id);
+ 		res = swap_chain->d3d_swap_chain->Present(swap_chain->sync_interval, swap_chain->present_flags);
++		if (SUCCEEDED(res) && swap_chain->latency_waitable != nullptr) {
++			swap_chain->present_pending = true;
++		}
+ 		if (!SUCCEEDED(res)) {
+ 			print_verbose(vformat("D3D12: Presenting swapchain failed with error 0x%08ux.", (uint64_t)res));
+ 			any_present_failed = true;
+@@ -2675,6 +2678,11 @@ void RenderingDeviceDriverD3D12::_swap_chain_release(SwapChain *p_swap_chain) {
+ 		p_swap_chain->render_pass = RenderPassID();
+ 	}
+ 
++	if (p_swap_chain->latency_waitable != nullptr) {
++		CloseHandle((HANDLE)p_swap_chain->latency_waitable);
++		p_swap_chain->latency_waitable = nullptr;
++	}
++	p_swap_chain->present_pending = false;
+ 	p_swap_chain->d3d_swap_chain.Reset();
+ }
+ 
+@@ -2759,6 +2767,9 @@ Error RenderingDeviceDriverD3D12::swap_chain_resize(CommandQueueID p_cmd_queue,
+ 		case DisplayServerEnums::VSYNC_ENABLED: {
+ 			sync_interval = 1;
+ 			present_flags = 0;
++			if (get_low_latency_mode() > 0) {
++				creation_flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
++			}
+ 		} break;
+ 		case DisplayServerEnums::VSYNC_DISABLED: {
+ 			sync_interval = 0;
+@@ -2769,6 +2780,9 @@ Error RenderingDeviceDriverD3D12::swap_chain_resize(CommandQueueID p_cmd_queue,
+ 		default:
+ 			sync_interval = 1;
+ 			present_flags = 0;
++			if (get_low_latency_mode() > 0) {
++				creation_flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
++			}
+ 			break;
+ 	}
+ 
+@@ -2884,6 +2898,13 @@ Error RenderingDeviceDriverD3D12::swap_chain_resize(CommandQueueID p_cmd_queue,
+ 	}
+ #endif
+ 
++	if ((creation_flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) && swap_chain->latency_waitable == nullptr) {
++		// Allow only one frame to be queued, so waiting on the object tells when the previous frame was taken for display.
++		if (SUCCEEDED(swap_chain->d3d_swap_chain->SetMaximumFrameLatency(1))) {
++			swap_chain->latency_waitable = (void *)swap_chain->d3d_swap_chain->GetFrameLatencyWaitableObject();
++		}
++	}
++
+ 	res = swap_chain->d3d_swap_chain->GetDesc1(&swap_chain_desc);
+ 	ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
+ 	ERR_FAIL_COND_V(swap_chain_desc.BufferCount == 0, ERR_CANT_CREATE);
+@@ -2973,6 +2994,20 @@ bool RenderingDeviceDriverD3D12::swap_chain_get_hdr_output_supported(SwapChainID
+ 	return true;
+ }
+ 
++bool RenderingDeviceDriverD3D12::swap_chain_wait_for_present(SwapChainID p_swap_chain, uint32_t p_frames_back, uint64_t p_timeout_ns) {
++	if (p_swap_chain.id == 0) {
++		return false;
++	}
++	SwapChain *swap_chain = (SwapChain *)(p_swap_chain.id);
++	if (swap_chain->latency_waitable == nullptr || !swap_chain->present_pending) {
++		return false;
++	}
++	// The waitable object behaves like a semaphore: it must be waited on once per Present, otherwise the count drifts.
++	swap_chain->present_pending = false;
++	const DWORD timeout_ms = DWORD(MAX(uint64_t(1), p_timeout_ns / 1000000ULL));
++	return WaitForSingleObjectEx((HANDLE)swap_chain->latency_waitable, timeout_ms, TRUE) == WAIT_OBJECT_0;
++}
++
+ void RenderingDeviceDriverD3D12::swap_chain_free(SwapChainID p_swap_chain) {
+ 	SwapChain *swap_chain = (SwapChain *)(p_swap_chain.id);
+ 	_swap_chain_release(swap_chain);
+diff --git a/drivers/d3d12/rendering_device_driver_d3d12.h b/drivers/d3d12/rendering_device_driver_d3d12.h
+index 14b3c41..4255356 100644
+--- a/drivers/d3d12/rendering_device_driver_d3d12.h
++++ b/drivers/d3d12/rendering_device_driver_d3d12.h
+@@ -531,6 +531,8 @@ private:
+ 		UINT present_flags = 0;
+ 		UINT sync_interval = 1;
+ 		UINT creation_flags = 0;
++		void *latency_waitable = nullptr; // HANDLE. // Signaled when the swap chain can accept another frame (low latency mode only).
++		bool present_pending = false;
+ 		RenderPassID render_pass;
+ 		TightLocalVector<ID3D12Resource *> render_targets;
+ 		TightLocalVector<TextureInfo> render_targets_info;
+@@ -549,6 +551,7 @@ public:
+ 	virtual Error swap_chain_resize(CommandQueueID p_cmd_queue, SwapChainID p_swap_chain, uint32_t p_desired_framebuffer_count) override;
+ 	virtual FramebufferID swap_chain_acquire_framebuffer(CommandQueueID p_cmd_queue, SwapChainID p_swap_chain, bool &r_resize_required) override;
+ 	virtual RenderPassID swap_chain_get_render_pass(SwapChainID p_swap_chain) override;
++	virtual bool swap_chain_wait_for_present(SwapChainID p_swap_chain, uint32_t p_frames_back, uint64_t p_timeout_ns) override;
+ 	virtual DataFormat swap_chain_get_format(SwapChainID p_swap_chain) override;
+ 	virtual ColorSpace swap_chain_get_color_space(SwapChainID p_swap_chain) override;
+ 	virtual bool swap_chain_get_hdr_output_supported(SwapChainID p_swap_chain) override;

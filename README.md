@@ -7,6 +7,7 @@ Patch set for Godot used by Thunder Engine. No Godot fork: upstream is cloned in
 - `patches/NNNN-feature/*.patch` — one directory per feature, applied in lexical order with `git apply`. Diffs are against upstream Godot.
   - `0001-opus-audio` — Opus audio module (`AudioStreamOpus`, libopus/libopusfile in thirdparty).
   - `0002-pixel-snap-2d` — 2D pixel-snap modes (`snap_2d_transforms_mode`, screen-space snapping, GPU particles).
+  - `0003-low-latency-present` — lower input latency with V-Sync: Vulkan `present_wait` / D3D12 waitable swapchain, optional late frame start (`rendering/rendering_device/vsync/low_latency`, env `GODOT_LOW_LATENCY=0|1|2`).
 - `scripts/prepare-source.sh <ref> <dir>` — clone upstream + apply patches (use locally too).
 - `.github/workflows/build.yml` — build and release.
 
