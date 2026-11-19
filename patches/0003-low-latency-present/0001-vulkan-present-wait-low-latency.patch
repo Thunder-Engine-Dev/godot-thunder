@@ -11,7 +11,7 @@ index 0e078c3..247c9d3 100644
  	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/rendering_device/staging_buffer/max_size_mb", PROPERTY_HINT_RANGE, "1,1024,1,or_greater"), 128);
  	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/rendering_device/staging_buffer/texture_upload_region_size_px", PROPERTY_HINT_RANGE, "1,256,1,or_greater"), 64);
 diff --git a/doc/classes/ProjectSettings.xml b/doc/classes/ProjectSettings.xml
-index f70c698..283d7a2 100644
+index f70c698..0d83194 100644
 --- a/doc/classes/ProjectSettings.xml
 +++ b/doc/classes/ProjectSettings.xml
 @@ -3398,6 +3398,13 @@
@@ -21,7 +21,7 @@ index f70c698..283d7a2 100644
 +		<member name="rendering/rendering_device/vsync/low_latency" type="int" setter="" getter="" default="2">
 +			Reduces input latency while V-Sync is enabled, on drivers that report when a frame reaches the screen (Vulkan with [code]VK_KHR_present_wait[/code]). Has no effect otherwise.
 +			[b]Off[/b] keeps the default behavior, where the engine reads input and then may stall for up to a full refresh waiting for a free swapchain image.
-+			[b]Wait For Presentation[/b] waits until the previous frame is on screen before reading input.
++			[b]Wait For Presentation[/b] waits until the previous frame is on screen and then reads input again, so the frame uses fresh input.
 +			[b]Adaptive[/b] additionally delays the start of each frame so that input is read as late as possible while the frame is still finished before the next refresh. The delay adapts automatically to the system.
 +			The environment variable [code]GODOT_LOW_LATENCY[/code] (0, 1 or 2) overrides this setting, for example [code]GODOT_LOW_LATENCY=0[/code] turns the feature off.
 +		</member>
@@ -163,7 +163,7 @@ index 2fc62fd..b494a32 100644
  	GodotProfileZoneGroupedFirst(_profile_zone, "prepare");
  	iterating++;
 diff --git a/servers/rendering/rendering_device.cpp b/servers/rendering/rendering_device.cpp
-index 861a790..e23f6db 100644
+index 861a790..afe222c 100644
 --- a/servers/rendering/rendering_device.cpp
 +++ b/servers/rendering/rendering_device.cpp
 @@ -39,6 +39,7 @@
@@ -174,7 +174,7 @@ index 861a790..e23f6db 100644
  #include "servers/rendering/rendering_device_binds.h"
  #include "servers/rendering/rendering_shader_container.h"
  #include "servers/rendering/shader_include_db.h"
-@@ -7866,6 +7867,104 @@ RenderingDevice::DriverWorkarounds RenderingDevice::get_driver_workarounds() con
+@@ -7866,6 +7867,106 @@ RenderingDevice::DriverWorkarounds RenderingDevice::get_driver_workarounds() con
  	return driver->get_driver_workarounds();
  }
  
@@ -266,9 +266,11 @@ index 861a790..e23f6db 100644
 +			while (int64_t(os->get_ticks_usec()) < target) {
 +			}
 +			slept = os->get_ticks_usec() - t1;
-+			DisplayServer::get_singleton()->process_events(); // Pick up whatever arrived while sleeping.
 +		}
 +	}
++	// The platform loop read input before this function ran. Read again now, so that the frame sees
++	// whatever arrived while waiting for the previous frame to be shown and while sleeping.
++	DisplayServer::get_singleton()->process_events();
 +	pacing.t_start = os->get_ticks_usec();
 +
 +	if (pacing.stats && (++pacing.counter % 180) == 0) {
@@ -279,7 +281,7 @@ index 861a790..e23f6db 100644
  void RenderingDevice::swap_buffers(bool p_present) {
  	ERR_RENDER_THREAD_GUARD();
  
-@@ -7874,6 +7973,7 @@ void RenderingDevice::swap_buffers(bool p_present) {
+@@ -7874,6 +7975,7 @@ void RenderingDevice::swap_buffers(bool p_present) {
  
  	GodotProfileZoneGrouped(_profile_zone, "_execute_frame");
  	_execute_frame(p_present);
