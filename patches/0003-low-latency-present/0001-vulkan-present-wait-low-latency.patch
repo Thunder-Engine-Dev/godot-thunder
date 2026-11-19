@@ -163,7 +163,7 @@ index 2fc62fd..b494a32 100644
  	GodotProfileZoneGroupedFirst(_profile_zone, "prepare");
  	iterating++;
 diff --git a/servers/rendering/rendering_device.cpp b/servers/rendering/rendering_device.cpp
-index 861a790..afe222c 100644
+index 861a790..b4858ad 100644
 --- a/servers/rendering/rendering_device.cpp
 +++ b/servers/rendering/rendering_device.cpp
 @@ -39,6 +39,7 @@
@@ -174,14 +174,37 @@ index 861a790..afe222c 100644
  #include "servers/rendering/rendering_device_binds.h"
  #include "servers/rendering/rendering_shader_container.h"
  #include "servers/rendering/shader_include_db.h"
-@@ -7866,6 +7867,106 @@ RenderingDevice::DriverWorkarounds RenderingDevice::get_driver_workarounds() con
+@@ -7866,14 +7867,182 @@ RenderingDevice::DriverWorkarounds RenderingDevice::get_driver_workarounds() con
  	return driver->get_driver_workarounds();
  }
  
 +void RenderingDevice::_pace_note_present() {
++	if (pacing.t_start != 0 && pacing.t_swap != 0) {
++		pacing.last_cpu = pacing.t_swap - pacing.t_start;
++		pacing.last_exec = OS::get_singleton()->get_ticks_usec() - pacing.t_swap;
++	}
 +	if (pacing.mode >= 2 && pacing.t_start != 0) {
 +		pacing.cost_ring[pacing.cost_idx++ % FramePacing::COST_SAMPLES] = OS::get_singleton()->get_ticks_usec() - pacing.t_start;
 +	}
++}
++
++void RenderingDevice::_pace_print_stats(const char *p_what, float *p_ring, uint32_t p_n, double p_nominal) {
++	if (p_n == 0) {
++		return;
++	}
++	double sum = 0, sq = 0;
++	float mx = 0;
++	uint32_t over = 0;
++	for (uint32_t i = 0; i < p_n; i++) {
++		sum += p_ring[i];
++		sq += double(p_ring[i]) * p_ring[i];
++		mx = MAX(mx, p_ring[i]);
++		if (p_nominal > 0 && p_ring[i] > p_nominal * 1.2) {
++			over++;
++		}
++	}
++	const double mean = sum / p_n;
++	print_line(vformat("LowLatencyEven: %s mean %.0f us, std %.0f us, max %.0f us, >1.2x nominal %d/%d", p_what, mean, Math::sqrt(MAX(0.0, sq / p_n - mean * mean)), (double)mx, (int)over, (int)p_n));
 +}
 +
 +void RenderingDevice::pace_frame_begin() {
@@ -195,7 +218,23 @@ index 861a790..afe222c 100644
 +		pacing.stats = !os->get_environment("GODOT_LOW_LATENCY_STATS").is_empty();
 +		pacing.margin_us = CLAMP(pacing.margin_us, int64_t(300), int64_t(15000));
 +	}
-+	if (pacing.mode == 0 || !is_main_instance || DisplayServer::get_singleton() == nullptr) {
++	if (!is_main_instance || DisplayServer::get_singleton() == nullptr) {
++		return;
++	}
++	if (pacing.stats) {
++		// Evenness of the cadence the game sees: interval between iteration starts.
++		const uint64_t t_in = os->get_ticks_usec();
++		if (pacing.last_in != 0 && pacing.n_in < FramePacing::STAT_N) {
++			pacing.in_ring[pacing.n_in++] = float(t_in - pacing.last_in);
++		}
++		pacing.last_in = t_in;
++		if (pacing.mode == 0 && pacing.n_in >= FramePacing::STAT_N) {
++			const float rr = DisplayServer::get_singleton()->screen_get_refresh_rate(DisplayServerEnums::SCREEN_OF_MAIN_WINDOW);
++			_pace_print_stats("frame-start", pacing.in_ring, pacing.n_in, rr > 10.0f ? 1000000.0 / rr : 0.0);
++			pacing.n_in = 0;
++		}
++	}
++	if (pacing.mode == 0) {
 +		return;
 +	}
 +	// Only meaningful when presentation is tied to the display refresh.
@@ -215,6 +254,7 @@ index 861a790..afe222c 100644
 +		return;
 +	}
 +
++	pacing.t_enter = os->get_ticks_usec();
 +	const float refresh = DisplayServer::get_singleton()->screen_get_refresh_rate(DisplayServerEnums::SCREEN_OF_MAIN_WINDOW);
 +	const double nominal = refresh > 10.0f ? 1000000.0 / refresh : 0.0;
 +
@@ -223,6 +263,9 @@ index 861a790..afe222c 100644
 +	const uint64_t wait_timeout_ns = nominal > 0.0 ? uint64_t(nominal * 3000.0) : 50000000ULL;
 +	const bool waited = driver->swap_chain_wait_for_present(it->value, 0, wait_timeout_ns);
 +	const uint64_t t1 = os->get_ticks_usec();
++	if (waited && pacing.stats && pacing.t_vblank != 0 && nominal > 0.0 && double(t1 - pacing.t_vblank) > nominal * 1.5) {
++		print_line(vformat("LongFrame: dt %d us, prev cpu %d us, prev exec(acquire+submit+present) %d us, wait this frame %d us", (int64_t)(t1 - pacing.t_vblank), (int64_t)pacing.last_cpu, (int64_t)pacing.last_exec, (int64_t)(t1 - pacing.t_enter)));
++	}
 +	if (!waited) {
 +		pacing.backoff = 60;
 +		pacing.t_vblank = 0;
@@ -233,15 +276,32 @@ index 861a790..afe222c 100644
 +	if (pacing.t_vblank != 0 && nominal > 0.0) {
 +		const double dt = double(t1 - pacing.t_vblank);
 +		pacing.total++;
++		pacing.miss_score *= 0.995;
++		if (pacing.n_vb < FramePacing::STAT_N) {
++			pacing.vb_ring[pacing.n_vb++] = float(dt);
++		}
 +		if (dt > nominal * 1.5) {
 +			// The last frame needed an extra refresh: start earlier from now on.
 +			pacing.missed++;
-+			pacing.dyn_margin_us = MIN(pacing.dyn_margin_us + 1000, int64_t(nominal) - 500);
++			// The first frames after startup and long stalls (3+ refreshes: compositor or system hiccups)
++			// say nothing about our own timing, so they must not inflate the margin.
++			if (pacing.total > 180 && dt < nominal * 2.5 && !pacing.last_missed && (pacing.miss_score += 1.0) >= 2.0) {
++				pacing.miss_score = 0.0;
++				pacing.dyn_margin_us = MIN(pacing.dyn_margin_us + 1000, int64_t(nominal) - 500);
++				// Every probe that fails costs a late frame: probe less often after a real miss.
++				pacing.probe_after = MIN(pacing.probe_after * 2, uint32_t(2880));
++			}
 +			pacing.ok_streak = 0;
-+		} else if (++pacing.ok_streak >= 90) {
-+			// Many frames in a row were on time: try starting a little later.
-+			pacing.dyn_margin_us = MAX(pacing.dyn_margin_us - 250, int64_t(300));
-+			pacing.ok_streak = 0;
++			pacing.last_missed = true;
++			pacing.miss_run++;
++		} else {
++			pacing.last_missed = false;
++			pacing.miss_run = 0;
++			if (++pacing.ok_streak >= pacing.probe_after) {
++				// Many frames in a row were on time: try starting a little later.
++				pacing.dyn_margin_us = MAX(pacing.dyn_margin_us - 250, int64_t(300));
++				pacing.ok_streak = 0;
++			}
 +		}
 +		if (dt > nominal * 0.8 && dt < nominal * 1.2) {
 +			pacing.period_us = pacing.period_us == 0.0 ? dt : (pacing.period_us * 0.98 + dt * 0.02);
@@ -273,6 +333,12 @@ index 861a790..afe222c 100644
 +	DisplayServer::get_singleton()->process_events();
 +	pacing.t_start = os->get_ticks_usec();
 +
++	if (pacing.stats && pacing.n_vb >= FramePacing::STAT_N) {
++		_pace_print_stats("present-wait", pacing.vb_ring, pacing.n_vb, nominal);
++		_pace_print_stats("frame-start", pacing.in_ring, pacing.n_in, nominal);
++		pacing.n_vb = 0;
++		pacing.n_in = 0;
++	}
 +	if (pacing.stats && (++pacing.counter % 180) == 0) {
 +		print_line(vformat("LowLatency: mode %d, margin %d us, missed %d/%d, period %.0f us, slept %d us", pacing.mode, (int64_t)pacing.dyn_margin_us, (int64_t)pacing.missed, (int64_t)pacing.total, pacing.period_us, (int64_t)slept));
 +	}
@@ -281,7 +347,9 @@ index 861a790..afe222c 100644
  void RenderingDevice::swap_buffers(bool p_present) {
  	ERR_RENDER_THREAD_GUARD();
  
-@@ -7874,6 +7975,7 @@ void RenderingDevice::swap_buffers(bool p_present) {
++	pacing.t_swap = OS::get_singleton()->get_ticks_usec();
+ 	GodotProfileZoneGroupedFirst(_profile_zone, "_end_frame");
+ 	_end_frame();
  
  	GodotProfileZoneGrouped(_profile_zone, "_execute_frame");
  	_execute_frame(p_present);
@@ -290,10 +358,10 @@ index 861a790..afe222c 100644
  	// Advance to the next frame and begin recording again.
  	frame = (frame + 1) % frames.size();
 diff --git a/servers/rendering/rendering_device.h b/servers/rendering/rendering_device.h
-index 38c4b14..213deb2 100644
+index 38c4b14..dbe47e6 100644
 --- a/servers/rendering/rendering_device.h
 +++ b/servers/rendering/rendering_device.h
-@@ -1300,6 +1300,25 @@ private:
+@@ -1300,6 +1300,36 @@ private:
  	/**** SCREEN ****/
  	/****************/
  	HashMap<DisplayServerEnums::WindowID, RDD::SwapChainID> screen_swap_chains;
@@ -310,16 +378,27 @@ index 38c4b14..213deb2 100644
 +		uint64_t cost_ring[COST_SAMPLES] = {};
 +		uint32_t cost_idx = 0;
 +		uint32_t ok_streak = 0;
++		bool last_missed = false;
++		uint32_t miss_run = 0;
++		double miss_score = 0.0; // Recent misses with exponential decay; isolated hiccups do not move the margin.
++		uint32_t probe_after = 90; // Frames without a miss before trying a smaller margin; grows after each real miss.
 +		uint32_t backoff = 0;
 +		uint64_t counter = 0;
 +		uint64_t missed = 0;
 +		uint64_t total = 0;
++		static constexpr uint32_t STAT_N = 180;
++		uint64_t last_in = 0;
++		uint64_t t_swap = 0, t_enter = 0, last_cpu = 0, last_exec = 0;
++		uint32_t n_in = 0, n_vb = 0;
++		float in_ring[STAT_N] = {};
++		float vb_ring[STAT_N] = {};
 +	} pacing;
++	void _pace_print_stats(const char *p_what, float *p_ring, uint32_t p_n, double p_nominal);
 +	void _pace_note_present();
  	HashMap<DisplayServerEnums::WindowID, RDD::FramebufferID> screen_framebuffers;
  
  	uint32_t _get_swap_chain_desired_count() const;
-@@ -1919,6 +1938,8 @@ public:
+@@ -1919,6 +1949,8 @@ public:
  	uint64_t limit_get(Limit p_limit) const;
  
  	void swap_buffers(bool p_present);
